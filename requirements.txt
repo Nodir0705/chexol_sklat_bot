@@ -1,14 +1,5 @@
-fastapi
-uvicorn[standard]
 python-telegram-bot[job-queue]==20.*
 SQLAlchemy==2.*
 aiosqlite
 python-dotenv
-Pillow
-jinja2
-python-multipart
 tzdata
-
-# Optional but recommended
-httpx
-python-multipart

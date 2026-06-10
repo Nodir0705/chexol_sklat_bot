@@ -133,6 +133,32 @@ function parseInitData(initData) {
   } catch { return null }
 }
 
+// ─── Auth ──────────────────────────────────────────────────────────────────────
+// Set DEV_OPEN_ACCESS=1 ONLY for local browser testing; must be unset in production.
+const ADMIN_ID = Number(process.env.ADMIN_ID ?? 0)
+const DEV_OPEN_ACCESS = process.env.DEV_OPEN_ACCESS === '1'
+
+// Returns the verified, approved Telegram user, or null. The user object only
+// comes from cryptographically-validated initData, so names/ids can't be spoofed.
+function verifiedUser(req) {
+  const user = parseInitData(req.headers['x-init-data'])
+  if (!user?.id) return null
+  if (ADMIN_ID && user.id === ADMIN_ID) return user
+  const row = db.prepare('SELECT status FROM users WHERE telegram_id = ?').get(user.id)
+  return row && row.status === 'approved' ? user : null
+}
+
+// Guard for mutating routes. Returns the user on success; on failure it sends a
+// 403 and returns null (the caller must `return` immediately). DEV_OPEN_ACCESS
+// yields an anonymous user so local browser testing still works.
+function requireAuth(req, reply) {
+  const user = verifiedUser(req)
+  if (user) return user
+  if (DEV_OPEN_ACCESS) return { id: null, first_name: null, username: null }
+  reply.code(403).send({ error: 'forbidden' })
+  return null
+}
+
 // ─── Excel export ─────────────────────────────────────────────────────────────
 
 function fullPath(catId, byId) {
@@ -243,6 +269,7 @@ app.get('/api/tree', (_req, reply) => {
 })
 
 app.post('/api/categories', (req, reply) => {
+  if (!requireAuth(req, reply)) return
   const { name, parent_id = null } = req.body ?? {}
   if (!name?.trim()) return reply.code(400).send({ error: 'name required' })
   const trimmed = name.trim()
@@ -275,12 +302,12 @@ app.get('/api/categories/:id/impact', (req, reply) => {
 
 // DELETE /api/categories/:id
 app.delete('/api/categories/:id', (req, reply) => {
+  const user = requireAuth(req, reply)
+  if (!user) return
   const rootId = Number(req.params.id)
   if (!rootId) return reply.code(400).send({ error: 'invalid id' })
 
-  const { user_name: bodyName } = req.body ?? {}
-  const user     = parseInitData(req.headers['x-init-data'])
-  const userName = user?.first_name ?? user?.username ?? bodyName ?? null
+  const userName = user.first_name ?? user.username ?? (req.body ?? {}).user_name ?? null
 
   db.exec('BEGIN')
   try {
@@ -308,11 +335,12 @@ app.delete('/api/categories/:id', (req, reply) => {
 })
 
 app.post('/api/transaction', (req, reply) => {
+  const user = requireAuth(req, reply)
+  if (!user) return
   const { category_id, qty, direction, user_name: bodyName } = req.body ?? {}
   if (!category_id || !qty || !['in', 'out'].includes(direction))
     return reply.code(400).send({ error: 'category_id, qty, direction required' })
-  const user     = parseInitData(req.headers['x-init-data'])
-  const userName = user?.first_name ?? user?.username ?? bodyName ?? null
+  const userName = user.first_name ?? user.username ?? bodyName ?? null
   const delta    = direction === 'in' ? qty : -qty
   const newQty   = applyStockChange(category_id, delta, user?.id, userName)
   return reply.send({ category_id, new_qty: newQty, delta })
@@ -321,8 +349,11 @@ app.post('/api/transaction', (req, reply) => {
 // GET /api/access — check if Telegram user is approved
 app.get('/api/access', (req, reply) => {
   const user = parseInitData(req.headers['x-init-data'])
-  if (!user?.id) return reply.send({ allowed: true }) // no initData = browser/dev access
-
+  if (!user?.id) {
+    // No valid initData: deny by default (fail closed), unless explicitly in dev.
+    return reply.send({ allowed: DEV_OPEN_ACCESS, reason: DEV_OPEN_ACCESS ? undefined : 'no_telegram' })
+  }
+  if (ADMIN_ID && user.id === ADMIN_ID) return reply.send({ allowed: true })
   const row = db.prepare('SELECT status FROM users WHERE telegram_id = ?').get(user.id)
   if (!row) return reply.send({ allowed: false, reason: 'pending' })
   if (row.status === 'approved') return reply.send({ allowed: true })
@@ -366,9 +397,10 @@ app.get('/api/export.xlsx', async (req, reply) => {
 
 // Send the Excel file to the user's Telegram chat (works inside the Mini App)
 app.post('/api/export', async (req, reply) => {
-  const user = parseInitData(req.headers['x-init-data'])
+  const user = verifiedUser(req)
   const period = normPeriod(req.body?.period)
   if (!user?.id) {
+    // Not an approved Telegram user — fall back to the browser download.
     return reply.code(400).send({ error: 'no_telegram', url: `/api/export.xlsx?period=${period}` })
   }
   if (!BOT_TOKEN) return reply.code(500).send({ error: 'no_token' })
