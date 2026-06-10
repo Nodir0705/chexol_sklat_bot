@@ -41,9 +41,13 @@ export async function postTransaction(
 }
 
 export async function checkAccess(): Promise<{ allowed: boolean; reason?: string }> {
-  const res = await fetch(`${BASE}/access`, { headers: initDataHeader() })
-  if (!res.ok) return { allowed: true } // fail open on server error
-  return res.json()
+  try {
+    const res = await fetch(`${BASE}/access`, { headers: initDataHeader() })
+    if (!res.ok) return { allowed: false, reason: 'error' } // fail closed on server error
+    return res.json()
+  } catch {
+    return { allowed: false, reason: 'error' }
+  }
 }
 
 export async function fetchHistory(limit = 100): Promise<HistoryEntry[]> {

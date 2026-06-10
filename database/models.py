@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, Float, ForeignKey, DateTime, BigInteger, UniqueConstraint
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, BigInteger
 from sqlalchemy.orm import declarative_base, relationship, backref
 from sqlalchemy.sql import func
 
@@ -17,38 +17,6 @@ class User(Base):
     # 'pending' | 'approved' | 'rejected'
     status = Column(String, default='pending')
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    inventory_items = relationship("Inventory", back_populates="user")
-    shopping_list = relationship("ShoppingList", back_populates="user")
-
-class Inventory(Base):
-    __tablename__ = 'inventory'
-    __table_args__ = (UniqueConstraint('user_id', 'item_name', name='uq_user_item'),)
-
-    id = Column(Integer, primary_key=True)
-    user_id = Column(BigInteger, ForeignKey('users.telegram_id'))
-    item_name = Column(String, nullable=False)
-    item_name_ru = Column(String)
-    category = Column(String) # meat, vegetable, grain, dairy, spice, other
-    quantity = Column(Float, default=0)
-    unit = Column(String) # kg, l, dona, paket
-    min_threshold = Column(Float) # alert when below this
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-
-    user = relationship("User", back_populates="inventory_items")
-
-class ShoppingList(Base):
-    __tablename__ = 'shopping_list'
-
-    id = Column(Integer, primary_key=True)
-    user_id = Column(BigInteger, ForeignKey('users.telegram_id'))
-    item_name = Column(String, nullable=False)
-    quantity = Column(Float)
-    unit = Column(String)
-    is_bought = Column(Boolean, default=False)
-    added_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    user = relationship("User", back_populates="shopping_list")
 
 # ─── Warehouse / Sklat models ─────────────────────────────────────────────────
 
@@ -97,12 +65,3 @@ class StockTransaction(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     category = relationship("ProductCategory", back_populates="transactions")
-
-
-class ReminderSubscriber(Base):
-    """Chat IDs that receive the daily stock reminder."""
-    __tablename__ = 'reminder_subscribers'
-
-    id = Column(Integer, primary_key=True)
-    chat_id = Column(BigInteger, unique=True, nullable=False)
-    added_at = Column(DateTime(timezone=True), server_default=func.now())
