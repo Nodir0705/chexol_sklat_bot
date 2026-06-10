@@ -4,7 +4,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BOT_TOKEN  = os.getenv("BOT_TOKEN")
-WEBAPP_URL = os.getenv("WEBAPP_URL", "")
+# Telegram Web App buttons require an https:// URL. Accept a bare domain and
+# normalise it so "myapp.up.railway.app" becomes "https://myapp.up.railway.app".
+WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip()
+if WEBAPP_URL and not WEBAPP_URL.startswith("http"):
+    WEBAPP_URL = "https://" + WEBAPP_URL
 # Point DB_PATH at a mounted volume in production so data survives redeploys.
 DB_NAME    = os.getenv("DB_PATH", "sklat.db")
 ADMIN_ID   = int(os.getenv("ADMIN_ID", "0"))
