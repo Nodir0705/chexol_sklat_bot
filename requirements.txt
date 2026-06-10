@@ -1,11 +1,14 @@
+fastapi
+uvicorn[standard]
 python-telegram-bot[job-queue]==20.*
 SQLAlchemy==2.*
 aiosqlite
 python-dotenv
 Pillow
-fastapi
-uvicorn
 jinja2
 python-multipart
 tzdata
-backports.zoneinfo; python_version < "3.9"
+
+# Optional but recommended
+httpx
+python-multipart
