@@ -1,0 +1,17 @@
+t=2026-06-10T03:04:13+0900 lvl=info msg="command usage" msg="Flag --domain has been deprecated, use --url instead"
+t=2026-06-10T03:04:13+0900 lvl=info msg="no configuration paths supplied"
+t=2026-06-10T03:04:13+0900 lvl=info msg="using configuration at default config path" path=/home/jarvis/.config/ngrok/ngrok.yml
+t=2026-06-10T03:04:13+0900 lvl=info msg="open config file" path=/home/jarvis/.config/ngrok/ngrok.yml err=nil
+t=2026-06-10T03:04:13+0900 lvl=info msg="FIPS 140 mode" enabled=false
+t=2026-06-10T03:04:13+0900 lvl=info msg="starting web service" obj=web addr=127.0.0.1:4040 allow_hosts=[]
+t=2026-06-10T03:04:14+0900 lvl=info msg="client session established" obj=tunnels.session
+t=2026-06-10T03:04:14+0900 lvl=info msg="tunnel session started" obj=tunnels.session
+t=2026-06-10T03:04:14+0900 lvl=info msg="update available" obj=updater
+t=2026-06-10T03:04:14+0900 lvl=info msg="started tunnel" obj=tunnels name=command_line addr=http://localhost:3001 url=https://subpanel-frequency-reclining.ngrok-free.dev
+t=2026-06-10T03:04:18+0900 lvl=info msg=start pg=/api/tunnels id=a8d7e618bf75f7d3
+t=2026-06-10T03:04:18+0900 lvl=info msg=end pg=/api/tunnels id=a8d7e618bf75f7d3 status=200 dur=1.123569ms
+t=2026-06-10T03:04:51+0900 lvl=info msg="join connections" obj=join id=48cc2d4e5224 l=127.0.0.1:3001 r=118.217.44.34:59682
+t=2026-06-10T03:04:52+0900 lvl=info msg="join connections" obj=join id=f116e25c4a38 l=127.0.0.1:3001 r=118.217.44.34:60260
+t=2026-06-10T03:06:34+0900 lvl=info msg="received stop request" obj=app stopReq="{err:<nil> restart:false}"
+t=2026-06-10T03:06:34+0900 lvl=info msg="session closing" obj=tunnels.session err=nil
+t=2026-06-10T03:06:34+0900 lvl=info msg="accept failed" obj=tunnels.session obj=csess id=a8ee278428fc err="reconnecting session closed"

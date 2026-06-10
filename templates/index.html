@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>UyBeka Mini App</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Use a specific version to be safe -->
+    <script src="https://unpkg.com/vue@3.4.0/dist/vue.global.js"></script>
+    <script src="https://unpkg.com/vue-router@4.0.15/dist/vue-router.global.js"></script>
+    <style>
+        body {
+            background-color: var(--tg-theme-bg-color, #f5f5f5);
+            color: var(--tg-theme-text-color, #000000);
+            -webkit-tap-highlight-color: transparent;
+        }
+        .card { background-color: var(--tg-theme-secondary-bg-color, #ffffff); }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        
+        /* Loading Spinner */
+        .spinner {
+            border: 4px solid rgba(0, 0, 0, 0.1);
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            border-left-color: #3b82f6;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body class="pb-24">
+    <div id="app">
+        <!-- Main Content -->
+        <main class="flex-1 p-4 min-h-screen flex flex-col">
+            <router-view></router-view>
+        </main>
+        <!-- Bottom Nav -->
+        <bottom-nav></bottom-nav>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            if (typeof Vue === 'undefined') {
+                document.body.innerHTML = '<h1 style="text-align:center; margin-top:20px; color:red;">Error: Vue.js failed to load. Check internet connection.</h1>';
+                return;
+            }
+
+            const { reactive, createApp } = Vue;
+            const { createRouter, createWebHashHistory } = VueRouter;
+
+            // --- STORE ---
+            const INITIAL_ITEMS = [
+                { id: 1, name: "Kartoshka", quantity: 5, unit: "kg", threshold: 2, category: "Sabzavot" },
+                { id: 2, name: "Piyoz", quantity: 1, unit: "kg", threshold: 2, category: "Sabzavot" },
+                { id: 3, name: "Un", quantity: 10, unit: "kg", threshold: 3, category: "Don" },
+                { id: 4, name: "Yog'", quantity: 0.5, unit: "l", threshold: 1, category: "Yog'lar" }
+            ];
+
+            const store = reactive({
+                items: JSON.parse(localStorage.getItem('uybeka_items')) || INITIAL_ITEMS,
+                addItem(item) {
+                    this.items.push({ ...item, id: Date.now() });
+                    this.save();
+                },
+                updateQuantity(id, change) {
+                    const item = this.items.find(i => i.id === id);
+                    if (item) {
+                        item.quantity += change;
+                        if (item.quantity < 0) item.quantity = 0;
+                        this.save();
+                    }
+                },
+                save() {
+                    localStorage.setItem('uybeka_items', JSON.stringify(this.items));
+                },
+                get lowStockItems() {
+                    return this.items.filter(i => i.quantity <= i.threshold);
+                }
+            });
+
+            // --- COMPONENTS ---
+            const BottomNav = {
+                template: `
+                <nav class="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 pb-safe shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)] z-50">
+                    <div class="flex justify-around items-center h-16">
+                        <router-link to="/" class="flex flex-col items-center justify-center w-full h-full text-gray-400" active-class="text-blue-500">
+                            <span class="text-2xl">🏠</span>
+                            <span class="text-[10px] mt-1 font-medium">Bosh sahifa</span>
+                        </router-link>
+                        <router-link to="/inventory" class="flex flex-col items-center justify-center w-full h-full text-gray-400" active-class="text-blue-500">
+                            <span class="text-2xl">📦</span>
+                            <span class="text-[10px] mt-1 font-medium">Ombor</span>
+                        </router-link>
+                        <div class="relative -top-5">
+                            <button class="w-14 h-14 rounded-full bg-blue-500 text-white flex items-center justify-center shadow-lg transform active:scale-95 transition">
+                                <span class="text-2xl font-bold">+</span>
+                            </button>
+                        </div>
+                        <router-link to="/shopping" class="flex flex-col items-center justify-center w-full h-full text-gray-400" active-class="text-blue-500">
+                            <span class="text-2xl">🛒</span>
+                            <span class="text-[10px] mt-1 font-medium">Bozorlik</span>
+                        </router-link>
+                        <router-link to="/recipes" class="flex flex-col items-center justify-center w-full h-full text-gray-400" active-class="text-blue-500">
+                            <span class="text-2xl">🍲</span>
+                            <span class="text-[10px] mt-1 font-medium">Taomlar</span>
+                        </router-link>
+                    </div>
+                </nav>
+                `
+            };
+
+            const HomePage = {
+                setup() { return { store }; },
+                template: `
+                <div class="space-y-6">
+                    <div class="flex justify-between items-center">
+                        <div>
+                            <h1 class="text-2xl font-bold text-gray-800">Assalomu alaykum!</h1>
+                            <p class="text-sm text-gray-500">Bugun oshxonada nima bor?</p>
+                        </div>
+                        <div class="w-10 h-10 rounded-full bg-gray-200 flex items-center justify-center text-xl">👤</div>
+                    </div>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div class="bg-white p-4 rounded-2xl shadow-sm">
+                            <div class="text-gray-500 text-xs font-medium uppercase mb-1">Jami Mahsulot</div>
+                            <div class="text-2xl font-bold text-gray-800">{{ store.items.length }}</div>
+                        </div>
+                        <div class="bg-red-50 p-4 rounded-2xl shadow-sm border border-red-100">
+                            <div class="text-red-500 text-xs font-medium uppercase mb-1">Kam Qolgan</div>
+                            <div class="text-2xl font-bold text-red-600">{{ store.lowStockItems.length }}</div>
+                        </div>
+                    </div>
+                    <div v-if="store.lowStockItems.length > 0" class="bg-white rounded-2xl p-4 shadow-sm">
+                        <h3 class="font-bold text-gray-800 mb-3 flex items-center"><span class="mr-2">⚠️</span> Tugayotgan mahsulotlar</h3>
+                        <div class="space-y-3">
+                            <div v-for="item in store.lowStockItems" :key="item.id" class="flex items-center justify-between p-2 bg-gray-50 rounded-xl">
+                                <div class="flex items-center space-x-3">
+                                    <div class="w-10 h-10 rounded-full bg-gray-100 flex items-center justify-center text-xl">🥔</div>
+                                    <div>
+                                        <div class="font-bold text-gray-800">{{ item.name }}</div>
+                                        <div class="text-xs text-red-500 font-medium">{{ item.quantity }} {{ item.unit }} qoldi</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                `
+            };
+
+            const InventoryPage = {
+                setup() { return { store }; },
+                template: `
+                <div class="space-y-4">
+                    <h2 class="text-xl font-bold text-gray-800">📦 Ombor</h2>
+                    <div class="flex space-x-2 overflow-x-auto no-scrollbar pb-2">
+                        <button class="px-4 py-2 bg-black text-white rounded-full text-sm font-medium whitespace-nowrap">Hammasi</button>
+                        <button class="px-4 py-2 bg-white text-gray-600 rounded-full text-sm font-medium whitespace-nowrap">Sabzavot</button>
+                        <button class="px-4 py-2 bg-white text-gray-600 rounded-full text-sm font-medium whitespace-nowrap">Mevalar</button>
+                    </div>
+                    <div class="grid grid-cols-2 gap-3">
+                        <div v-for="item in store.items" :key="item.id" class="bg-white p-3 rounded-2xl shadow-sm relative">
+                            <div class="absolute top-3 right-3 w-2 h-2 rounded-full" :class="item.quantity <= item.threshold ? 'bg-red-500' : 'bg-green-500'"></div>
+                            <div class="flex justify-center mb-2 text-4xl">🥔</div>
+                            <div class="text-center mb-3">
+                                <div class="font-bold text-gray-800">{{ item.name }}</div>
+                                <div class="text-xs text-gray-500">{{ item.category }}</div>
+                            </div>
+                            <div class="flex items-center justify-between bg-gray-50 rounded-xl p-1">
+                                <button @click="store.updateQuantity(item.id, -1)" class="w-8 h-8 flex items-center justify-center bg-white rounded-lg shadow-sm text-gray-600">-</button>
+                                <span class="font-bold text-sm">{{ item.quantity }} {{ item.unit }}</span>
+                                <button @click="store.updateQuantity(item.id, 1)" class="w-8 h-8 flex items-center justify-center bg-white rounded-lg shadow-sm text-blue-600">+</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                `
+            };
+
+            // --- ROUTER ---
+            const routes = [
+                { path: '/', component: HomePage },
+                { path: '/inventory', component: InventoryPage },
+                { path: '/shopping', component: { template: '<div class="text-center mt-10 text-gray-500">🛒 Shopping List<br>Tez orada!</div>' } },
+                { path: '/recipes', component: { template: '<div class="text-center mt-10 text-gray-500">🍲 Recipes<br>Tez orada!</div>' } },
+            ];
+
+            const router = createRouter({
+                history: createWebHashHistory(),
+                routes,
+            });
+
+            // --- APP ---
+            const app = createApp({
+                components: { 'bottom-nav': BottomNav },
+                setup() {
+                    const tg = window.Telegram?.WebApp;
+                    if (tg) {
+                        tg.ready();
+                        tg.expand();
+                    }
+                    return {};
+                }
+            });
+
+            app.use(router);
+            app.mount('#app');
+        });
+    </script>
+</body>
+</html>

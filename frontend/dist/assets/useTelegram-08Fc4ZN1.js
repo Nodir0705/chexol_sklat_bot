@@ -1,0 +1,1 @@
+import"./vendor-CFZi8CBh.js";const e=(()=>{var r;const c=(r=window.Telegram)==null?void 0:r.WebApp;return c&&(c.ready(),c.expand()),c??null})();function t(c="light"){e&&(c==="success"||c==="error"?e.HapticFeedback.notificationOccurred(c):e.HapticFeedback.impactOccurred(c))}export{t as h};
