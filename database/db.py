@@ -30,12 +30,20 @@ async def init_db():
                 await conn.execute(text(sql))
             except Exception:
                 pass
-        # Existing users stay approved; admin is always approved
-        from config import ADMIN_ID
+        # Pre-approve the admin and any allow-listed users, creating their row if
+        # it doesn't exist yet so they can use the app without sending /start.
+        from config import ADMIN_ID, APPROVED_IDS
+        approved = set(APPROVED_IDS)
         if ADMIN_ID:
+            approved.add(ADMIN_ID)
+        for tid in approved:
+            await conn.execute(
+                text("INSERT OR IGNORE INTO users (telegram_id, status) VALUES (:id, 'approved')"),
+                {"id": tid},
+            )
             await conn.execute(
                 text("UPDATE users SET status='approved' WHERE telegram_id = :id"),
-                {"id": ADMIN_ID}
+                {"id": tid},
             )
     await seed_initial_data()
 
