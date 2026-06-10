@@ -12,6 +12,8 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 ENV PYTHON=/opt/venv/bin/python
+# Flush stdout immediately so startup logs are visible in Railway.
+ENV PYTHONUNBUFFERED=1
 
 # --- Node deps (cached on lockfiles) ---
 # --include=dev: the frontend build needs tsc/vite (devDependencies), which npm
