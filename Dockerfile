@@ -14,8 +14,10 @@ RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir -r req
 ENV PYTHON=/opt/venv/bin/python
 
 # --- Node deps (cached on lockfiles) ---
+# --include=dev: the frontend build needs tsc/vite (devDependencies), which npm
+# would otherwise skip when Railway sets NODE_ENV=production.
 COPY frontend/package.json frontend/package-lock.json ./frontend/
-RUN cd frontend && npm ci
+RUN cd frontend && npm ci --include=dev
 COPY server/package.json server/package-lock.json ./server/
 RUN cd server && npm ci
 
