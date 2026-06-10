@@ -302,5 +302,3 @@ if os.path.isdir(DIST_DIR):
         return FileResponse(os.path.join(DIST_DIR, "index.html"))
 
 
-if __name__ == "__main__":
-    uvicorn.run("webapp:app", host="0.0.0.0", port=8000, reload=True)
