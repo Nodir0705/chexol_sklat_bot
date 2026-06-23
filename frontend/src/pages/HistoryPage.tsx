@@ -72,9 +72,6 @@ function Entry({ entry }: { entry: HistoryEntry }) {
   const isDel = entry.action_type === 'delete'
   const isIn  = entry.delta > 0
 
-  const iconBg    = isDel ? 'rgba(239,68,68,.1)'   : isIn ? 'rgba(34,197,94,.12)' : 'rgba(239,68,68,.12)'
-  const iconColor = isDel ? '#9ca3af'               : isIn ? '#22c55e'             : '#ef4444'
-  const icon      = isDel ? '🗑'                    : isIn ? '+'                   : '−'
   const valColor  = isDel ? 'var(--tg-theme-hint-color)' : isIn ? '#22c55e'       : '#ef4444'
   const valText   = isDel
     ? (Math.abs(entry.delta) > 0 ? `−${Math.abs(entry.delta)}` : '—')
@@ -82,10 +79,6 @@ function Entry({ entry }: { entry: HistoryEntry }) {
 
   return (
     <div className={`flex items-center gap-3 px-4 py-3.5 ${isDel ? 'opacity-60' : ''}`}>
-      <div className="w-10 h-10 rounded-full flex items-center justify-center text-sm font-bold shrink-0"
-           style={{ background: iconBg, color: iconColor }}>
-        {icon}
-      </div>
       <div className="flex-1 min-w-0">
         {entry.category_path && (
           <p className="text-xs truncate" style={{ color: 'var(--tg-theme-hint-color)' }}>
