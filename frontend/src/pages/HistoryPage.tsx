@@ -81,9 +81,9 @@ function Entry({ entry }: { entry: HistoryEntry }) {
     <div className={`flex items-center gap-3 px-4 py-3.5 ${isDel ? 'opacity-60' : ''}`}>
       <div className="flex-1 min-w-0">
         <div className="flex items-baseline gap-1.5 min-w-0">
-          <span className="font-bold text-base truncate">{entry.category_name}</span>
+          <span className="font-bold text-base whitespace-nowrap shrink-0">{entry.category_name}</span>
           {entry.category_path && (
-            <span className="text-xs shrink-0 truncate" style={{ color: 'var(--tg-theme-hint-color)' }}>
+            <span className="text-xs min-w-0 truncate" style={{ color: 'var(--tg-theme-hint-color)' }}>
               → {entry.category_path}
             </span>
           )}
