@@ -25,22 +25,12 @@ function tashkentDayStr(date: Date) {
 function formatTashkent(utcStr: string): { dateLabel: string; time: string } {
   const utc = new Date(utcStr.replace(' ', 'T') + 'Z')
   const t   = toTashkent(utc)
-  const now = toTashkent(new Date())
 
-  const today = now.toISOString().slice(0, 10)
-  const yest  = toTashkent(new Date(Date.now() - 86_400_000)).toISOString().slice(0, 10)
-  const day   = t.toISOString().slice(0, 10)
+  const p = (n: number) => String(n).padStart(2, '0')
+  const dateLabel = `${p(t.getUTCDate())}.${p(t.getUTCMonth() + 1)}.${t.getUTCFullYear()}`
+  const time = `${p(t.getUTCHours())}:${p(t.getUTCMinutes())}`
 
-  const hh = String(t.getUTCHours()).padStart(2, '0')
-  const mm = String(t.getUTCMinutes()).padStart(2, '0')
-
-  const MONTHS = ['','Yan','Fev','Mar','Apr','May','Iyun','Iyul','Avg','Sen','Okt','Noy','Dek']
-  const dateLabel =
-    day === today ? 'Bugun' :
-    day === yest  ? 'Kecha' :
-    `${t.getUTCDate()} ${MONTHS[t.getUTCMonth() + 1]}`
-
-  return { dateLabel, time: `${hh}:${mm}` }
+  return { dateLabel, time }
 }
 
 function filterEntries(entries: HistoryEntry[], filter: Filter): HistoryEntry[] {
@@ -98,7 +88,7 @@ function Entry({ entry }: { entry: HistoryEntry }) {
           {entry.performed_by_name}  •  {dateLabel}, {time}
         </p>
       </div>
-      <span className="font-bold text-sm shrink-0" style={{ color: valColor }}>{valText}</span>
+      <span className="font-bold text-lg shrink-0" style={{ color: valColor }}>{valText}</span>
     </div>
   )
 }
