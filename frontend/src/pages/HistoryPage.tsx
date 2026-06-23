@@ -133,6 +133,9 @@ export default function HistoryPage() {
       if (last?.label === dateLabel) last.items.push(entry)
       else result.push({ label: dateLabel, items: [entry] })
     }
+    // Header label stays relative (Bugun/Kecha); rows show the numeric date.
+    const todayIso = tashkentDayStr(new Date())
+    const yestIso  = tashkentDayStr(new Date(Date.now() - 86_400_000))
     // Per-day totals of quantity added (kirish) and removed (chiqish).
     // Deletions are excluded so totals match the green/red rows below.
     return result.map(g => {
@@ -143,7 +146,9 @@ export default function HistoryPage() {
         if (e.delta > 0) totalIn += e.delta
         else totalOut += -e.delta
       }
-      return { ...g, totalIn, totalOut }
+      const dayIso = tashkentDayStr(new Date(g.items[0].created_at.replace(' ', 'T') + 'Z'))
+      const headerLabel = dayIso === todayIso ? 'Bugun' : dayIso === yestIso ? 'Kecha' : g.label
+      return { ...g, totalIn, totalOut, headerLabel }
     })
   }, [filtered])
 
@@ -246,7 +251,7 @@ export default function HistoryPage() {
                    style={{ borderBottom: '1px solid rgba(128,128,128,.1)' }}>
                 <span className="text-xs font-semibold uppercase tracking-wide"
                       style={{ color: 'var(--tg-theme-hint-color)' }}>
-                  {group.label}
+                  {group.headerLabel}
                 </span>
                 <span className="flex items-center gap-3 text-xs font-bold shrink-0">
                   <span style={{ color: '#22c55e' }}>➕ {group.totalIn} dona</span>
