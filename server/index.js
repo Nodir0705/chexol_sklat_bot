@@ -50,7 +50,7 @@ const q = {
     VALUES (?, ?, ?, ?, ?)
   `),
   history: db.prepare(`
-    SELECT st.id, pc.name AS category_name, st.delta,
+    SELECT st.id, st.category_id, pc.name AS category_name, st.delta,
            COALESCE(st.performed_by_name, 'Noma''lum') AS performed_by_name,
            COALESCE(st.action_type, 'stock') AS action_type,
            st.created_at
@@ -364,7 +364,16 @@ app.get('/api/access', (req, reply) => {
 
 app.get('/api/history', (req, reply) => {
   const limit = Math.min(Number(req.query.limit ?? 100), 500)
-  return reply.send(q.history.all(limit))
+  // Resolve each row's parent path (tur › sub-tur) so leaves with the same
+  // name under different turs are distinguishable. Include deleted categories
+  // so history for removed products still resolves its location.
+  const allCats = db.prepare('SELECT id, parent_id, name FROM product_categories').all()
+  const byId = new Map(allCats.map(c => [c.id, c]))
+  const rows = q.history.all(limit).map(r => ({
+    ...r,
+    category_path: fullPath(r.category_id, byId),
+  }))
+  return reply.send(rows)
 })
 
 app.get('/api/report', (req, reply) => {

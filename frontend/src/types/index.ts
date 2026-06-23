@@ -16,6 +16,7 @@ export interface TreeNode extends Category {
 export interface HistoryEntry {
   id: number
   category_name: string
+  category_path: string
   delta: number
   performed_by_name: string
   action_type: 'stock' | 'delete'
