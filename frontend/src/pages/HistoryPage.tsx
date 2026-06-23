@@ -87,6 +87,11 @@ function Entry({ entry }: { entry: HistoryEntry }) {
         {icon}
       </div>
       <div className="flex-1 min-w-0">
+        {entry.category_path && (
+          <p className="text-xs truncate" style={{ color: 'var(--tg-theme-hint-color)' }}>
+            📍 {entry.category_path}
+          </p>
+        )}
         <div className="flex items-center gap-1.5">
           <p className="font-medium truncate text-sm">{entry.category_name}</p>
           {isDel && (
@@ -145,7 +150,18 @@ export default function HistoryPage() {
       if (last?.label === dateLabel) last.items.push(entry)
       else result.push({ label: dateLabel, items: [entry] })
     }
-    return result
+    // Per-day totals of quantity added (kirish) and removed (chiqish).
+    // Deletions are excluded so totals match the green/red rows below.
+    return result.map(g => {
+      let totalIn = 0
+      let totalOut = 0
+      for (const e of g.items) {
+        if (e.action_type === 'delete') continue
+        if (e.delta > 0) totalIn += e.delta
+        else totalOut += -e.delta
+      }
+      return { ...g, totalIn, totalOut }
+    })
   }, [filtered])
 
   return (
@@ -243,10 +259,16 @@ export default function HistoryPage() {
           {groups.map(group => (
             <div key={group.label} className="rounded-2xl overflow-hidden"
                  style={{ background: 'var(--tg-theme-secondary-bg-color)' }}>
-              <div className="px-4 py-2 text-xs font-semibold uppercase tracking-wide"
-                   style={{ color: 'var(--tg-theme-hint-color)',
-                            borderBottom: '1px solid rgba(128,128,128,.1)' }}>
-                {group.label} · {group.items.length} ta
+              <div className="px-4 py-2 flex items-center justify-between gap-2"
+                   style={{ borderBottom: '1px solid rgba(128,128,128,.1)' }}>
+                <span className="text-xs font-semibold uppercase tracking-wide"
+                      style={{ color: 'var(--tg-theme-hint-color)' }}>
+                  {group.label}
+                </span>
+                <span className="flex items-center gap-3 text-xs font-bold shrink-0">
+                  <span style={{ color: '#22c55e' }}>➕ {group.totalIn} dona</span>
+                  <span style={{ color: '#ef4444' }}>➖ {group.totalOut} dona</span>
+                </span>
               </div>
               {group.items.map((entry, i) => (
                 <div key={entry.id}>
