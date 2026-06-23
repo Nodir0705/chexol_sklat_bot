@@ -80,13 +80,13 @@ function Entry({ entry }: { entry: HistoryEntry }) {
   return (
     <div className={`flex items-center gap-3 px-4 py-3.5 ${isDel ? 'opacity-60' : ''}`}>
       <div className="flex-1 min-w-0">
-        {entry.category_path && (
-          <p className="text-xs truncate" style={{ color: 'var(--tg-theme-hint-color)' }}>
-            {entry.category_path}
-          </p>
-        )}
-        <div className="flex items-center gap-1.5">
-          <p className="font-medium truncate text-sm">{entry.category_name}</p>
+        <div className="flex items-baseline gap-1.5 min-w-0">
+          <span className="font-bold text-base truncate">{entry.category_name}</span>
+          {entry.category_path && (
+            <span className="text-xs shrink-0 truncate" style={{ color: 'var(--tg-theme-hint-color)' }}>
+              → {entry.category_path}
+            </span>
+          )}
           {isDel && (
             <span className="text-xs px-1.5 py-0.5 rounded shrink-0"
                   style={{ background: 'rgba(239,68,68,.1)', color: '#ef4444' }}>
