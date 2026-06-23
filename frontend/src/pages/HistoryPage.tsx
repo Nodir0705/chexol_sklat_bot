@@ -88,7 +88,7 @@ function Entry({ entry }: { entry: HistoryEntry }) {
           {entry.performed_by_name}  •  {dateLabel}, {time}
         </p>
       </div>
-      <span className="font-bold text-lg shrink-0" style={{ color: valColor }}>{valText}</span>
+      <span className="font-bold text-2xl shrink-0" style={{ color: valColor }}>{valText}</span>
     </div>
   )
 }
