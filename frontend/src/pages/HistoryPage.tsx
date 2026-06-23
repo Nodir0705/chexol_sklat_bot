@@ -89,7 +89,7 @@ function Entry({ entry }: { entry: HistoryEntry }) {
       <div className="flex-1 min-w-0">
         {entry.category_path && (
           <p className="text-xs truncate" style={{ color: 'var(--tg-theme-hint-color)' }}>
-            📍 {entry.category_path}
+            {entry.category_path}
           </p>
         )}
         <div className="flex items-center gap-1.5">
