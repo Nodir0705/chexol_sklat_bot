@@ -1,0 +1,42 @@
+# Hostinger VPS deployment. Two containers:
+#   app   — the existing image (Python bot + Node API + built SPA), bound to the
+#           private compose network only; never exposed directly to the internet.
+#   caddy — TLS terminator / reverse proxy. Gets a Let's Encrypt certificate for
+#           $DOMAIN automatically on first start (Telegram Mini Apps require https).
+#
+# Usage:  cp .env.example .env && edit  →  docker compose up -d --build
+
+services:
+  app:
+    build: .
+    image: chexol-sklat:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # The SQLite file lives on the host bind-mount below, so it survives
+      # `docker compose down`, rebuilds and image changes.
+      DB_PATH: /data/sklat.db
+      PORT: "3001"
+    volumes:
+      - ./data:/data
+    expose:
+      - "3001"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data      # issued certificates — keep, or you re-issue on every restart
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

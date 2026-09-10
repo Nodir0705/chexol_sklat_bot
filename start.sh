@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the Telegram bot and the Mini App server together in one container so they
 # share the same SQLite file. The web server runs in the foreground (it is the
-# container's lifecycle / Railway healthcheck target); the bot runs alongside and
+# container's lifecycle / healthcheck target); the bot runs alongside and
 # is kept alive without being able to take the web server down.
 set -uo pipefail
 
@@ -31,6 +31,6 @@ fi
   done
 ) &
 
-# 3. Web server in the foreground. Railway provides $PORT.
+# 3. Web server in the foreground on $PORT (3001 by default).
 echo "[start.sh] starting web server..." >&2
 cd server && exec node --experimental-sqlite index.js

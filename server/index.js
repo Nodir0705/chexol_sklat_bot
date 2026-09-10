@@ -12,7 +12,7 @@ import ExcelJS from 'exceljs'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 dotenvConfig({ path: join(__dirname, '..', '.env') })
 // Must match the Python bot's DB path so both processes share one file (the
-// Railway volume). Falls back to the repo-root sklat.db for local dev.
+// mounted /data volume). Falls back to the repo-root sklat.db for local dev.
 const DB_PATH  = process.env.DB_PATH ?? join(__dirname, '..', 'sklat.db')
 const FRONTEND = join(__dirname, '..', 'frontend', 'dist')
 const PORT     = Number(process.env.PORT ?? 3001)

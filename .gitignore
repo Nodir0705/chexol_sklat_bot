@@ -25,3 +25,7 @@ frontend/dist/
 .DS_Store
 .idea/
 .vscode/
+
+# VPS deployment
+/data/
+/backups/
