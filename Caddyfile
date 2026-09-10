@@ -1,0 +1,7 @@
+# $DOMAIN is injected by docker-compose from .env.
+# Caddy obtains and renews the Let's Encrypt certificate on its own; port 80
+# must stay open for the ACME HTTP challenge and the http→https redirect.
+{$DOMAIN} {
+	encode zstd gzip
+	reverse_proxy app:3001
+}

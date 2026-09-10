@@ -1,9 +1,9 @@
-# Deterministic build for Railway: Python (Telegram bot) + Node (Mini App server
+# Deterministic build: Python (Telegram bot) + Node (Mini App server
 # and frontend build) in one image so the two processes share one SQLite file.
 FROM node:22-bookworm-slim
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends python3 python3-venv python3-pip ca-certificates bash \
+ && apt-get install -y --no-install-recommends python3 python3-venv python3-pip ca-certificates bash sqlite3 \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -12,12 +12,12 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 ENV PYTHON=/opt/venv/bin/python
-# Flush stdout immediately so startup logs are visible in Railway.
+# Flush stdout immediately so startup logs are visible in `docker compose logs`.
 ENV PYTHONUNBUFFERED=1
 
 # --- Node deps (cached on lockfiles) ---
 # --include=dev: the frontend build needs tsc/vite (devDependencies), which npm
-# would otherwise skip when Railway sets NODE_ENV=production.
+# would otherwise skip if NODE_ENV=production is set.
 COPY frontend/package.json frontend/package-lock.json ./frontend/
 RUN cd frontend && npm ci --include=dev
 COPY server/package.json server/package-lock.json ./server/
