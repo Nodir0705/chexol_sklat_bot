@@ -11,6 +11,10 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+# httpx logs every request URL at INFO, and python-telegram-bot puts the token in
+# the path — so each getUpdates poll would write the bot token into the container
+# logs in plaintext. WARNING still surfaces real transport failures.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 async def post_init(application: Application):
