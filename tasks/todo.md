@@ -29,11 +29,14 @@ Hostinger VPS (KVM), Docker. Railway project deleted only AFTER verification.
 - [x] Commit locally (push held until you confirm)
 
 ## Phase 2 — Provision the VPS
-- [ ] Need from user: VPS IP, SSH user/key, chosen domain
-- [ ] DNS: A record `@`/subdomain → VPS IP (propagate before Caddy first run)
-- [ ] Install Docker Engine + compose plugin
-- [ ] ufw: allow 22, 80, 443; deny the rest
-- [ ] Clone repo, write `.env` (real token), drop rescued `sklat.db` into `./data/`
+- [x] VPS 187.53.134.187 (srv1957718, Ubuntu 26.04.1), key-based root SSH working
+- [x] Already provisioned: Docker 29.8.0, Compose v5.5.1, ufw active (22/80/443), nothing on 80/443
+- [ ] **BLOCKER: domain still needed.** A record → 187.53.134.187, propagate before Caddy's first start
+- [x] Docker + compose already present — nothing to install
+- [x] ufw already correct
+- [x] Cloned to /srv/chexol_sklat_bot @ d0ac65c; `./data/` created (fresh DB, no restore)
+- [x] **Smoke test passed**: image builds, `/api/tree` returns the seeded tree, `/` serves the SPA (200 text/html), DB persists to `./data/sklat.db` (clean path)
+- [ ] Rewrite `.env` with the REAL BOT_TOKEN + domain (currently a dummy smoke-test token)
 
 ## Phase 3 — Cutover
 - [ ] `docker compose up -d --build`

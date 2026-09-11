@@ -13,8 +13,10 @@ KEEP_DAYS="${KEEP_DAYS:-30}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
 mkdir -p "$DEST"
+# </dev/null: `exec -T` forwards stdin, which would otherwise swallow the rest of
+# a calling script (or a cron heredoc) feeding this one.
 docker compose -f "$ROOT/docker-compose.yml" exec -T app \
-  sqlite3 /data/sklat.db ".backup '/data/backup-$STAMP.db'"
+  sqlite3 /data/sklat.db ".backup '/data/backup-$STAMP.db'" </dev/null
 mv "$ROOT/data/backup-$STAMP.db" "$DEST/sklat-$STAMP.db"
 gzip -f "$DEST/sklat-$STAMP.db"
 
