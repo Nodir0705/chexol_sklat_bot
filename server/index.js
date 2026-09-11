@@ -252,7 +252,7 @@ async function buildWorkbook(period = 'all') {
     })
   }
 
-  return wb
+  return { wb, txnCount: txns.length }
 }
 
 // ─── Fastify ──────────────────────────────────────────────────────────────────
@@ -399,7 +399,7 @@ function exportFileName(period) {
 // Direct download (browser fallback) — ?period=all|week|month
 app.get('/api/export.xlsx', async (req, reply) => {
   const period = normPeriod(req.query.period)
-  const wb = await buildWorkbook(period)
+  const { wb } = await buildWorkbook(period)
   const buf = await wb.xlsx.writeBuffer()
   reply.header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
   reply.header('Content-Disposition', `attachment; filename="${exportFileName(period)}"`)
@@ -417,7 +417,7 @@ app.post('/api/export', async (req, reply) => {
   if (!BOT_TOKEN) return reply.code(500).send({ error: 'no_token' })
 
   try {
-    const wb = await buildWorkbook(period)
+    const { wb, txnCount } = await buildWorkbook(period)
     const buf = await wb.xlsx.writeBuffer()
     const form = new FormData()
     form.append('chat_id', String(user.id))
@@ -431,7 +431,7 @@ app.post('/api/export', async (req, reply) => {
     })
     const tgJson = await tgRes.json()
     if (!tgJson.ok) return reply.code(502).send({ error: 'telegram_failed', detail: tgJson.description })
-    return reply.send({ sent: true })
+    return reply.send({ sent: true, txnCount })
   } catch (err) {
     return reply.code(500).send({ error: String(err) })
   }
