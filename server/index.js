@@ -16,6 +16,7 @@ dotenvConfig({ path: join(__dirname, '..', '.env') })
 const DB_PATH  = process.env.DB_PATH ?? join(__dirname, '..', 'sklat.db')
 const FRONTEND = join(__dirname, '..', 'frontend', 'dist')
 const PORT     = Number(process.env.PORT ?? 3001)
+const MAX_QTY  = 99999   // matches the cap the Mini App's quantity input enforces
 const BOT_TOKEN = process.env.BOT_TOKEN
 
 // ─── SQLite ────────────────────────────────────────────────────────────────────
@@ -77,12 +78,31 @@ function applyStockChange(categoryId, delta, userId, userName) {
   db.exec('BEGIN')
   try {
     const row = q.getStock.get(categoryId)
-    const newQty = Math.max(0, (row ? row.quantity : 0) + delta)
+    const prevQty = row ? row.quantity : 0
+    const newQty = Math.max(0, prevQty + delta)
+    // Log the delta that was actually applied. Logging the *requested* delta
+    // meant a clamped removal (take 500 from a stock of 11) recorded -500
+    // against an 11-unit movement, permanently overstating total_out in the
+    // report and in every Excel export.
+    const applied = newQty - prevQty
     q.upsertStk.run(categoryId, newQty)
-    q.logTxn.run(categoryId, delta, userId ?? null, userName ?? null, 'stock')
+    q.logTxn.run(categoryId, applied, userId ?? null, userName ?? null, 'stock')
     db.exec('COMMIT')
-    return newQty
+    return { newQty, applied }
   } catch (err) { db.exec('ROLLBACK'); throw err }
+}
+
+/** A category that may hold stock: active, and with no children of its own. */
+function stockTarget(categoryId) {
+  const cat = db.prepare(
+    'SELECT id FROM product_categories WHERE id = ? AND deleted_at IS NULL'
+  ).get(categoryId)
+  if (!cat) return { ok: false, error: 'category not found or deleted' }
+  const child = db.prepare(
+    'SELECT 1 FROM product_categories WHERE parent_id = ? AND deleted_at IS NULL LIMIT 1'
+  ).get(categoryId)
+  if (child) return { ok: false, error: 'category is not a product' }
+  return { ok: true }
 }
 
 // Returns all descendant IDs (including self) using a recursive CTE
@@ -99,17 +119,28 @@ function allDescendantIds(rootId) {
   `).all(rootId).map(r => r.id)
 }
 
-// Returns leaf descendants (no children among active categories) with their stock
+// Returns the descendants that actually represent products, with their stock.
+//
+// "No *active* children" was the old test, and it was wrong in both directions:
+// a folder whose children had all been deleted looked like a product (producing
+// a phantom "deleted, qty 0" row in the history and every export), while a
+// folder that had wrongly accumulated stock was skipped entirely, so deleting it
+// left a live stock_items row orphaned and uncounted.
+//
+// A node counts as a product if it has never had children at all, or if it holds
+// a stock row — which also sweeps up any stock stranded by the old behaviour.
 function leafDescendants(ids) {
   if (!ids.length) return []
-  const parentIds = new Set(
+  const everParent = new Set(
     db.prepare(`
-      SELECT DISTINCT parent_id FROM product_categories
-      WHERE parent_id IS NOT NULL AND deleted_at IS NULL
+      SELECT DISTINCT parent_id FROM product_categories WHERE parent_id IS NOT NULL
     `).all().map(r => r.parent_id)
   )
+  const stocked = new Set(
+    db.prepare('SELECT category_id FROM stock_items').all().map(r => r.category_id)
+  )
   return ids
-    .filter(id => !parentIds.has(id))
+    .filter(id => !everParent.has(id) || stocked.has(id))
     .map(id => {
       const cat = db.prepare('SELECT name FROM product_categories WHERE id = ?').get(id)
       const stk = db.prepare('SELECT quantity FROM stock_items WHERE category_id = ?').get(id)
@@ -117,12 +148,18 @@ function leafDescendants(ids) {
     })
 }
 
+// Telegram signs initData once; without an expiry a captured string is a
+// permanent credential, revocable only by rotating the bot token.
+const INIT_DATA_MAX_AGE_S = 24 * 60 * 60
+
 function parseInitData(initData) {
   if (!BOT_TOKEN || !initData) return null
   try {
     const params = new URLSearchParams(initData)
     const hash = params.get('hash')
     if (!hash) return null
+    const authDate = Number(params.get('auth_date'))
+    if (!authDate || Math.abs(Date.now() / 1000 - authDate) > INIT_DATA_MAX_AGE_S) return null
     params.delete('hash')
     const checkStr = [...params.entries()]
       .sort(([a], [b]) => a.localeCompare(b))
@@ -142,12 +179,29 @@ const DEV_OPEN_ACCESS = process.env.DEV_OPEN_ACCESS === '1'
 
 // Returns the verified, approved Telegram user, or null. The user object only
 // comes from cryptographically-validated initData, so names/ids can't be spoofed.
+function initDataOf(req) {
+  // A plain browser navigation (the .xlsx fallback) cannot set a header.
+  return req.headers['x-init-data'] || req.query?.initData || null
+}
+
 function verifiedUser(req) {
-  const user = parseInitData(req.headers['x-init-data'])
+  const user = parseInitData(initDataOf(req))
   if (!user?.id) return null
   if (ADMIN_ID && user.id === ADMIN_ID) return user
   const row = db.prepare('SELECT status FROM users WHERE telegram_id = ?').get(user.id)
   return row && row.status === 'approved' ? user : null
+}
+
+// Guard for read-only routes. The warehouse inventory, the staff-attributed
+// transaction log and the Excel export are business data — they were previously
+// served to anyone who knew the hostname, which Certificate Transparency
+// publishes. Same rules as requireAuth, minus the mutation.
+function requireRead(req, reply) {
+  const user = verifiedUser(req)
+  if (user) return user
+  if (DEV_OPEN_ACCESS) return { id: null }
+  reply.code(403).send({ error: 'forbidden' })
+  return null
 }
 
 // Guard for mutating routes. Returns the user on success; on failure it sends a
@@ -264,7 +318,8 @@ await app.register(staticFiles, { root: FRONTEND })
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-app.get('/api/tree', (_req, reply) => {
+app.get('/api/tree', (req, reply) => {
+  if (!requireRead(req, reply)) return
   const categories = q.allCats.all()
   const stock = Object.fromEntries(q.allStock.all().map(r => [r.category_id, r.quantity]))
   return reply.send({ categories, stock })
@@ -275,6 +330,20 @@ app.post('/api/categories', (req, reply) => {
   const { name, parent_id = null } = req.body ?? {}
   if (!name?.trim()) return reply.code(400).send({ error: 'name required' })
   const trimmed = name.trim()
+
+  if (parent_id !== null) {
+    if (!Number.isInteger(parent_id))
+      return reply.code(400).send({ error: 'parent_id must be an integer' })
+    const parent = db.prepare(
+      'SELECT id FROM product_categories WHERE id = ? AND deleted_at IS NULL'
+    ).get(parent_id)
+    if (!parent) return reply.code(400).send({ error: 'parent not found or deleted' })
+    // Giving a stocked product a child turns it into a folder, and the client
+    // only shows quantities for leaves — the stock would vanish from the UI.
+    const held = db.prepare('SELECT quantity FROM stock_items WHERE category_id = ?').get(parent_id)
+    if (held && held.quantity > 0)
+      return reply.code(409).send({ error: 'parent still holds stock', quantity: held.quantity })
+  }
   db.exec('BEGIN')
   try {
     q.insCat.run(trimmed, parent_id)
@@ -289,6 +358,7 @@ app.post('/api/categories', (req, reply) => {
 
 // GET /api/categories/:id/impact — what will be deleted (for confirmation UI)
 app.get('/api/categories/:id/impact', (req, reply) => {
+  if (!requireRead(req, reply)) return
   const rootId = Number(req.params.id)
   if (!rootId) return reply.code(400).send({ error: 'invalid id' })
 
@@ -340,17 +410,26 @@ app.post('/api/transaction', (req, reply) => {
   const user = requireAuth(req, reply)
   if (!user) return
   const { category_id, qty, direction, user_name: bodyName } = req.body ?? {}
-  if (!category_id || !qty || !['in', 'out'].includes(direction))
+  if (!Number.isInteger(category_id) || !['in', 'out'].includes(direction))
     return reply.code(400).send({ error: 'category_id, qty, direction required' })
+  // qty was previously only checked for truthiness, so a negative, fractional,
+  // string or absurdly large value went straight into the arithmetic — and
+  // {qty:-500, direction:'in'} silently wiped a category's stock.
+  if (!Number.isInteger(qty) || qty < 1 || qty > MAX_QTY)
+    return reply.code(400).send({ error: `qty must be an integer between 1 and ${MAX_QTY}` })
+
+  const target = stockTarget(category_id)
+  if (!target.ok) return reply.code(400).send({ error: target.error })
+
   const userName = user.first_name ?? user.username ?? bodyName ?? null
   const delta    = direction === 'in' ? qty : -qty
-  const newQty   = applyStockChange(category_id, delta, user?.id, userName)
-  return reply.send({ category_id, new_qty: newQty, delta })
+  const { newQty, applied } = applyStockChange(category_id, delta, user?.id, userName)
+  return reply.send({ category_id, new_qty: newQty, delta: applied, requested: delta })
 })
 
 // GET /api/access — check if Telegram user is approved
 app.get('/api/access', (req, reply) => {
-  const user = parseInitData(req.headers['x-init-data'])
+  const user = parseInitData(initDataOf(req))
   if (!user?.id) {
     // No valid initData: deny by default (fail closed), unless explicitly in dev.
     return reply.send({ allowed: DEV_OPEN_ACCESS, reason: DEV_OPEN_ACCESS ? undefined : 'no_telegram' })
@@ -363,6 +442,7 @@ app.get('/api/access', (req, reply) => {
 })
 
 app.get('/api/history', (req, reply) => {
+  if (!requireRead(req, reply)) return
   const limit = Math.min(Number(req.query.limit ?? 100), 500)
   // Resolve each row's parent path (tur › sub-tur) so leaves with the same
   // name under different turs are distinguishable. Include deleted categories
@@ -377,6 +457,7 @@ app.get('/api/history', (req, reply) => {
 })
 
 app.get('/api/report', (req, reply) => {
+  if (!requireRead(req, reply)) return
   const tashkent = new Date(Date.now() + 5 * 60 * 60 * 1000)
   const year  = String(req.query.year  ?? tashkent.getUTCFullYear())
   const month = String(req.query.month ?? tashkent.getUTCMonth() + 1).padStart(2, '0')
@@ -398,6 +479,7 @@ function exportFileName(period) {
 
 // Direct download (browser fallback) — ?period=all|week|month
 app.get('/api/export.xlsx', async (req, reply) => {
+  if (!requireRead(req, reply)) return
   const period = normPeriod(req.query.period)
   const { wb } = await buildWorkbook(period)
   const buf = await wb.xlsx.writeBuffer()

@@ -135,13 +135,14 @@ export default function ActionPage() {
   const confirm = useCallback(() => {
     if (!selected || qty <= 0) return
     haptic('medium')
-    const preQty = selected.qty ?? 0
-    const newQty = direction === 'in' ? preQty + qty : Math.max(0, preQty - qty)
-    const snapshot = { name: selected.name, path: pathOf(selected.id), qty, direction, newQty }
+    const base = { name: selected.name, path: pathOf(selected.id), qty, direction }
     txn.mutate({ category_id: selected.id, qty, direction }, {
-      onSuccess: () => {
+      // Use the server's new_qty. Deriving it from the cached quantity showed a
+      // figure that disagreed with the ledger whenever the cache was stale or
+      // the removal got clamped at zero.
+      onSuccess: (data) => {
         haptic('success')
-        setResult(snapshot)
+        setResult({ ...base, newQty: data.new_qty })
         setSelectedId(null)
         setQty(1)
         setTimeout(() => setResult(null), 4000)
