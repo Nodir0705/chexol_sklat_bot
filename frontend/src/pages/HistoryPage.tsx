@@ -108,12 +108,17 @@ export default function HistoryPage() {
     setExporting(true)
     setExportMsg(null)
     try {
-      const { mode } = await exportExcel(period)
+      const { mode, txnCount } = await exportExcel(period)
+      // An empty period is not a failure — say so, or it reads as a broken download.
+      const noActivity = txnCount === 0
+        ? ' (bu davrda harakat yo\'q — faqat zaxira)'
+        : ''
       setExportMsg(mode === 'telegram'
-        ? '✅ Excel fayl Telegram chatingizga yuborildi'
+        ? `✅ Excel fayl Telegram chatingizga yuborildi${noActivity}`
         : '✅ Excel fayl yuklab olindi')
-    } catch {
-      setExportMsg('❌ Xatolik. Qaytadan urinib ko\'ring.')
+    } catch (err) {
+      const detail = err instanceof Error && err.message !== 'Export failed' ? ` (${err.message})` : ''
+      setExportMsg(`❌ Xatolik${detail}. Qaytadan urinib ko\'ring.`)
     } finally {
       setExporting(false)
       setTimeout(() => setExportMsg(null), 4000)

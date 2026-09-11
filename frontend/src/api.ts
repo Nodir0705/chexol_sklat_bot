@@ -58,21 +58,42 @@ export async function fetchHistory(limit = 100): Promise<HistoryEntry[]> {
 
 export type ExportPeriod = 'all' | 'week' | 'month'
 
+export interface ExportResult {
+  mode: 'telegram' | 'browser'
+  /** History rows the period matched. 0 means the file holds stock only. */
+  txnCount?: number
+}
+
+/** Telegram's in-app WebView blocks window.open, so links must go through the SDK. */
+function openExternal(url: string) {
+  const tg = window.Telegram?.WebApp
+  if (tg?.openLink) tg.openLink(new URL(url, location.origin).href)
+  else window.open(url, '_blank')
+}
+
 // In Telegram: bot sends the .xlsx to the user's chat. In browser: triggers a download.
-export async function exportExcel(period: ExportPeriod): Promise<{ mode: 'telegram' | 'browser' }> {
+export async function exportExcel(period: ExportPeriod): Promise<ExportResult> {
   const initData = window.Telegram?.WebApp?.initData
+  const directUrl = `${BASE}/export.xlsx?period=${period}`
+
   if (initData) {
     const res = await fetch(`${BASE}/export`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-init-data': initData },
       body: JSON.stringify({ period }),
     })
-    if (!res.ok) throw new Error('Export failed')
-    await res.json()
-    return { mode: 'telegram' }
+    const body = await res.json().catch(() => null)
+    if (res.ok) return { mode: 'telegram', txnCount: body?.txnCount }
+    // The server hands back a browser-download URL when it cannot reach the user
+    // through Telegram. Using it beats showing a generic failure.
+    if (body?.url) {
+      openExternal(body.url)
+      return { mode: 'browser' }
+    }
+    throw new Error(body?.detail || body?.error || 'Export failed')
   }
-  // Browser fallback — open the direct download
-  window.open(`${BASE}/export.xlsx?period=${period}`, '_blank')
+
+  openExternal(directUrl)
   return { mode: 'browser' }
 }
 

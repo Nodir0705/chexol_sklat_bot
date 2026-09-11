@@ -16,6 +16,8 @@ declare global {
         close: () => void
         initData: string
         initDataUnsafe: { user?: TgUser }
+        /** Opens a URL outside the WebView; window.open is blocked in Telegram. */
+        openLink?: (url: string) => void
         colorScheme: 'light' | 'dark'
         themeParams: {
           bg_color?: string
