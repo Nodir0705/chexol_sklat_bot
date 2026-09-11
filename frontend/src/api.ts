@@ -13,7 +13,7 @@ function tgUserName(): string | null {
 }
 
 export async function fetchTree(): Promise<{ categories: Category[]; stock: StockMap }> {
-  const res = await fetch(`${BASE}/tree`)
+  const res = await fetch(`${BASE}/tree`, { headers: initDataHeader() })
   if (!res.ok) throw new Error('Failed to fetch')
   return res.json()
 }
@@ -51,7 +51,7 @@ export async function checkAccess(): Promise<{ allowed: boolean; reason?: string
 }
 
 export async function fetchHistory(limit = 100): Promise<HistoryEntry[]> {
-  const res = await fetch(`${BASE}/history?limit=${limit}`)
+  const res = await fetch(`${BASE}/history?limit=${limit}`, { headers: initDataHeader() })
   if (!res.ok) throw new Error('Failed to fetch history')
   return res.json()
 }
@@ -75,6 +75,7 @@ function openExternal(url: string) {
 export async function exportExcel(period: ExportPeriod): Promise<ExportResult> {
   const initData = window.Telegram?.WebApp?.initData
   const directUrl = `${BASE}/export.xlsx?period=${period}`
+    + (initData ? `&initData=${encodeURIComponent(initData)}` : '')
 
   if (initData) {
     const res = await fetch(`${BASE}/export`, {
@@ -87,7 +88,7 @@ export async function exportExcel(period: ExportPeriod): Promise<ExportResult> {
     // The server hands back a browser-download URL when it cannot reach the user
     // through Telegram. Using it beats showing a generic failure.
     if (body?.url) {
-      openExternal(body.url)
+      openExternal(initData ? `${body.url}&initData=${encodeURIComponent(initData)}` : body.url)
       return { mode: 'browser' }
     }
     throw new Error(body?.detail || body?.error || 'Export failed')
@@ -98,7 +99,7 @@ export async function exportExcel(period: ExportPeriod): Promise<ExportResult> {
 }
 
 export async function fetchDeleteImpact(id: number): Promise<DeleteImpact> {
-  const res = await fetch(`${BASE}/categories/${id}/impact`)
+  const res = await fetch(`${BASE}/categories/${id}/impact`, { headers: initDataHeader() })
   if (!res.ok) throw new Error('Failed to fetch impact')
   return res.json()
 }
