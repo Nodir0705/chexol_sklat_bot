@@ -31,25 +31,53 @@ Hostinger VPS (KVM), Docker. Railway project deleted only AFTER verification.
 ## Phase 2 — Provision the VPS
 - [x] VPS 187.53.134.187 (srv1957718, Ubuntu 26.04.1), key-based root SSH working
 - [x] Already provisioned: Docker 29.8.0, Compose v5.5.1, ufw active (22/80/443), nothing on 80/443
-- [ ] **BLOCKER: domain still needed.** A record → 187.53.134.187, propagate before Caddy's first start
+- [x] Domain: `chexol-sklat.duckdns.org` → 187.53.134.187 (DuckDNS; on the Public Suffix List, so Let's Encrypt rate limits are per-subdomain)
 - [x] Docker + compose already present — nothing to install
 - [x] ufw already correct
 - [x] Cloned to /srv/chexol_sklat_bot @ d0ac65c; `./data/` created (fresh DB, no restore)
 - [x] **Smoke test passed**: image builds, `/api/tree` returns the seeded tree, `/` serves the SPA (200 text/html), DB persists to `./data/sklat.db` (clean path)
-- [ ] Rewrite `.env` with the REAL BOT_TOKEN + domain (currently a dummy smoke-test token)
+- [x] `.env` written with the real BOT_TOKEN + domain, chmod 600, DEV_OPEN_ACCESS removed
 
 ## Phase 3 — Cutover
-- [ ] `docker compose up -d --build`
-- [ ] Verify: `https://DOMAIN/` serves the SPA, `/api/tree` returns the real category tree + stock
-- [ ] Set `WEBAPP_URL=DOMAIN` in `.env`, restart app
-- [ ] Bot: `/start` in Telegram → button opens the Mini App over HTTPS
-- [ ] @BotFather: update Menu Button / Web App URL if one was configured (user action)
-- [ ] Confirm stock numbers + history match what Railway showed
+- [x] `docker compose up -d` — both containers running
+- [x] Let's Encrypt certificate obtained for chexol-sklat.duckdns.org (expires 2026-12-10, auto-renews)
+- [x] `https://…/` → HTTP/2 200 text/html, `SSL certificate verify ok`
+- [x] `https://…/api/tree` → seeded category tree
+- [x] `http://` → 308 redirect to https
+- [x] Bot online: `Application started`, `@chexol_1_bot` (id 8579564443), no webhook set, polling clean
+- [x] Auth fails closed: POST /api/transaction, POST /api/categories, DELETE /api/categories/:id all 403 without initData; /api/access → `{"allowed":false,"reason":"no_telegram"}`
+- [x] Nightly backup cron installed (03:17), snapshot verified `integrity_check ok`
+- [x] Survives reboot: docker enabled at boot + `restart: unless-stopped`
+- [ ] **USER TEST: `/start` in Telegram → "🏭 Sklatni ochish" opens the Mini App**
+- [x] @BotFather menu button was never set to a Web App URL (`type: commands`) — nothing stale to fix
 
 ## Phase 4 — Decommission
-- [ ] Take a final backup of `./data/sklat.db` off the VPS
-- [ ] Delete the Railway project (user, in dashboard)
-- [ ] Add a nightly `sqlite3 .backup` cron on the VPS
+- [x] Nightly `sqlite3 .backup` cron on the VPS
+- [ ] Delete the Railway project (user, in dashboard) — **only after the /start test passes**
+- [ ] Note: deleting the project also destroys the 50.9 MB volume holding the old stock history.
+      That is the point of no return on the data the user chose to abandon.
+
+## Review
+
+Migrated from Railway to Hostinger VPS 187.53.134.187 (Ubuntu 26.04.1), Docker Compose.
+The old deployment had been Offline since 2026-06-24.
+
+**What changed in the repo:** `railway.json` deleted; `docker-compose.yml` (app + Caddy) and
+`Caddyfile` added; `scripts/backup.sh` and `DEPLOY.md` added; `sqlite3` added to the image;
+`APPROVED_IDS` pinned in `.env.example`. Application code was not touched beyond comments.
+
+**Two latent bugs found and not carried over:**
+1. Railway's `DB_PATH` was `"/data/sklat.db "` with a trailing space — the real file on the
+   volume was literally named with that space. It only worked because Python and Node both
+   read the same malformed value. Compose now sets a clean path.
+2. `APPROVED_IDS` was unset, so `config.py`'s hardcoded fallback id `752030660` was granted
+   warehouse access on every startup. Now pinned to the admin id.
+
+**One bug introduced and fixed:** `scripts/backup.sh` used `docker compose exec -T`, which
+forwards stdin and silently ate the rest of any calling script. Fixed with `</dev/null` (5caf713).
+
+**Data:** started empty by the user's decision. Old history remains on the Railway volume until
+that project is deleted.
 
 ## Open decision — domain
 Telegram Mini Apps require a real HTTPS domain (no bare IP, no self-signed).
