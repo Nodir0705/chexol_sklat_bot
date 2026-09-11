@@ -29,3 +29,6 @@ frontend/dist/
 # VPS deployment
 /data/
 /backups/
+
+# Local planning notes — not part of the deployable app
+/tasks/
