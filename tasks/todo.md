@@ -4,22 +4,29 @@ Target: `chexol_sklat_bot` (Python bot + Node/Fastify API + React Mini App, one 
 Hostinger VPS (KVM), Docker. Railway project deleted only AFTER verification.
 
 ## Phase 0 — Rescue from Railway (do FIRST, nothing is recoverable after deletion)
-- [ ] Install Railway CLI (`npm i -g @railway/cli`)
-- [ ] `railway login` (interactive — user runs it)
-- [ ] `railway link` to the chexol project/service
-- [ ] `railway variables` → capture BOT_TOKEN, ADMIN_ID, APPROVED_IDS, WEBAPP_URL, DB_PATH
-- [ ] Determine if a volume exists (DB_PATH set?). If unset → no persistent data ever existed
-- [ ] STOP the Railway service (do not delete) — avoids 409 polling conflict + last-minute writes
-- [ ] Snapshot SQLite **WAL-safe**: `.backup`/checkpoint, not a raw `cat` (server runs journal_mode=WAL)
-- [ ] Verify locally: `PRAGMA integrity_check` + row counts for users / product_categories / stock_items / stock_transactions
+- [x] Install Railway CLI (`npm i -g @railway/cli`)
+- [x] `railway login` + link `compassionate-energy` / `chexol_sklat_bot`
+- [x] Captured BOT_TOKEN, ADMIN_ID (1444766498), WEBAPP_URL, DB_PATH → scratchpad, chmod 600
+- [x] Volume confirmed: `chexol_sklat_bot-volume` /data, 50.9 MB, Ready
+- [x] Service already Offline since 2026-06-24 → no 409 polling conflict at cutover
+- [~] **Data rescue SKIPPED — user chose a fresh empty database.**
+      Volume file access requires a live deployment (no download/export exists in Railway's
+      GraphQL API); the trial ended, so redeploying is not possible without a paid plan.
+      The volume is not pending deletion, so this stays recoverable until the project is deleted.
+
+### Gotchas found on Railway (not to be carried over)
+- `DB_PATH` was `"/data/sklat.db "` — **trailing space**. It worked only because Python and
+  Node read the same malformed value. docker-compose sets a clean `/data/sklat.db`.
+- `APPROVED_IDS` was never set, so `config.py`'s hardcoded `752030660` was auto-approved on
+  every startup. The VPS `.env` sets it explicitly to the admin id instead.
 
 ## Phase 1 — Repo changes for VPS (local, reversible)
-- [ ] `docker-compose.yml`: app (build .), env_file, `./data:/data`, `DB_PATH=/data/sklat.db`, bind `127.0.0.1:3001`, `restart: unless-stopped`
-- [ ] `Caddyfile` + caddy service: automatic Let's Encrypt TLS, reverse proxy → app:3001
-- [ ] Delete `railway.json`
-- [ ] De-Railway the comments in Dockerfile / start.sh / .env.example
-- [ ] `DEPLOY.md` runbook (provision, deploy, backup, restore, update)
-- [ ] Commit + push to GitHub
+- [x] `docker-compose.yml`: app (build .), env_file, `./data:/data`, `DB_PATH=/data/sklat.db`, bind `127.0.0.1:3001`, `restart: unless-stopped`
+- [x] `Caddyfile` + caddy service: automatic Let's Encrypt TLS, reverse proxy → app:3001
+- [x] Delete `railway.json`
+- [x] De-Railway the comments in Dockerfile / start.sh / .env.example
+- [x] `DEPLOY.md` runbook (provision, deploy, backup, restore, update)
+- [x] Commit locally (push held until you confirm)
 
 ## Phase 2 — Provision the VPS
 - [ ] Need from user: VPS IP, SSH user/key, chosen domain
