@@ -6,6 +6,15 @@
 // make Telegram reject a message and silently cut a client off from receipts.
 // clients.js now imports formatReceipt from here — keep it that way.
 //
+// It is also the ONLY place a product is NAMED. productLabel() is exported for
+// server/statement.js, so the Mahsulot column of the monthly workbook and the
+// receipt the client got in September say the same words about the same thing.
+//
+// Three entry points:
+//   productLabel(name, parent)            — "Tarpetka › Damas"
+//   formatReceipt(entry, balance, orig)   — one ledger row
+//   formatBatchReceipt(entries, balance, opts) — two or more rows, one message
+//
 // The ledger row is committed before a receipt is attempted, and nothing here
 // ever throws: a Telegram outage must not stop the owner recording business.
 // Every failure is one log line and a { ok: false, error } return value.
@@ -32,6 +41,96 @@ const NOTE_MAX = 120
 // The reverse route writes this when the owner gives no reason; it is bookkeeping
 // noise, not a message to the client.
 const AUTO_NOTE = /^Bekor qilindi #\d+$/
+
+// The batch list's rule, U+2500 × 10. Ten columns is wide enough to read as a
+// rule and short enough that it can never be the line that wraps.
+const RULE = '──────────'
+
+// ─── Product naming ────────────────────────────────────────────────────────────
+//
+// One rule, one place. Six leaves ("Damas", "Coblet", "Lasetiy", "N2", "N3",
+// "Onex") exist under BOTH "Tarpetka" and "!Tikuvda tarpetka💈", and three more
+// ("Qora", "Seriy", "Donalik") are bare colours — a receipt naming only the leaf
+// is unrecoverably ambiguous. Qualifying costs ~11 characters; not qualifying
+// costs a dispute nobody can settle from the message.
+
+/** U+203A — the separator fullPath() and the workbook's Joylashuv column use. */
+const PATH_SEP = ' › '
+
+// o' / o‘ / o’ / oʻ / oʼ is ONE Uzbek letter typed five ways (plus the two
+// keyboard stand-ins ` and ´). Unified before comparison, and kept INSIDE the
+// token so "qo'shimcha" stays one word instead of becoming "qo" + "shimcha".
+// Written as escapes so no editor or copy-paste can quietly re-fold the class.
+const APOSTROPHES = /[\u2018\u2019\u02BB\u02BC\u0060\u00B4]/g
+
+/**
+ * Comparison tokens for a category name. NFC first — the same Uzbek name can
+ * arrive pre-composed or decomposed and must compare equal. Then .toLowerCase(),
+ * deliberately the locale-INDEPENDENT one: toLocaleLowerCase() is locale-sensitive,
+ * and a product's printed name must not depend on the server's LANG.
+ *
+ * Every non-alphanumeric except the apostrophe is a token break: space, !, (, ),
+ * -, ., emoji, ZWJ, variation selectors. So "!Tikuvda tarpetka💈" → ["tikuvda",
+ * "tarpetka"], and the decorative chrome the owner types cannot affect matching.
+ */
+function tokens(name) {
+  return String(name ?? '').normalize('NFC').toLowerCase()
+    .replace(APOSTROPHES, "'")
+    .split(/[^\p{L}\p{N}']+/u)
+    .filter(Boolean)
+}
+
+/**
+ * Is `needle` a CONTIGUOUS, in-order run inside `hay`? A subarray test, not a
+ * subset test: "Ali cantara safir" must not be considered present in a leaf that
+ * merely happens to use all three words somewhere.
+ */
+function containsRun(hay, needle) {
+  if (!needle.length || needle.length > hay.length) return false
+  for (let i = 0; i + needle.length <= hay.length; i++) {
+    let hit = true
+    for (let j = 0; j < needle.length; j++) {
+      if (hay[i + j] !== needle[j]) { hit = false; break }
+    }
+    if (hit) return true
+  }
+  return false
+}
+
+/**
+ * How a product is named ANYWHERE in this system: "Parent › Leaf", except when
+ * the leaf's tokens already contain the parent's tokens as a contiguous in-order
+ * run — then the leaf alone, because repeating it reads as a stutter.
+ *
+ *   ("Ali cantara safir Qora", "Ali cantara safir") → "Ali cantara safir Qora"
+ *   ("Qora",  "Cristal")                            → "Cristal › Qora"
+ *   ("Damas", "Tarpetka")                           → "Tarpetka › Damas"
+ *   ("Damas", "!Tikuvda tarpetka💈")                → "!Tikuvda tarpetka💈 › Damas"
+ *
+ * Two cases that look alike and are NOT:
+ *   - No parent at all — a root category, or a caller whose SELECT does not join
+ *     one yet — returns the leaf alone. That is what keeps every existing receipt
+ *     byte-identical until LEDGER_SELECT grows its parent JOIN, and it is why
+ *     this function degrades instead of printing a dangling "Tarpetka › ".
+ *   - A parent that TOKENISES to nothing ("💈", "!!!") is NOT contained, so the
+ *     parent is KEPT. Deliberate asymmetry: a wrongly suppressed parent is an
+ *     ambiguous receipt nobody can recover from; a wrongly kept one costs
+ *     ~11 characters.
+ *
+ * Returns RAW text — no HTML escaping. The Telegram renderers esc() the finished
+ * label; the Excel workbook must never receive "&amp;" in a cell. (PATH_SEP holds
+ * nothing HTML-special, so escaping the whole label equals escaping its parts.)
+ *
+ * The parent name must come from a JOIN, never from splitting category_path:
+ * POST /api/categories only trims the name, so an owner-entered name may itself
+ * contain " › ".
+ */
+export function productLabel(categoryName, parentName) {
+  const leaf   = String(categoryName ?? '').trim()
+  const parent = String(parentName ?? '').trim()
+  if (!leaf || !parent) return leaf
+  return containsRun(tokens(leaf), tokens(parent)) ? leaf : parent + PATH_SEP + leaf
+}
 
 // ─── Formatting ────────────────────────────────────────────────────────────────
 
@@ -122,8 +221,10 @@ function tashkentStamp(at) {
  * wrong sum on a receipt.
  *
  * @param entry   a client_ledger row (LEDGER_SELECT shape): kind, category_id,
- *                category_name, qty, unit_price, amount, note, reverses_id,
- *                created_at. `amount` is signed; figures print as magnitudes.
+ *                category_name, parent_name, qty, unit_price, amount, note,
+ *                reverses_id, created_at. `amount` is signed; figures print as
+ *                magnitudes. `parent_name` is optional — absent, the product
+ *                renders exactly as it did before productLabel() existed.
  * @param balance the client's balance AFTER this entry, signed.
  * @param orig    for a reversal, the row being cancelled — its label and its
  *                stamp head the quote, because the message points backwards.
@@ -135,7 +236,10 @@ export function formatReceipt(entry, balance, orig = null) {
 
   const total    = som(Math.abs(Math.trunc(Number(e.amount) || 0)))
   const hasGoods = e.category_id != null && e.qty != null
-  const product  = esc(e.category_name ?? '?')
+  // productLabel() is the one naming rule; '?' survives for a row whose category
+  // was deleted (LEDGER_SELECT's LEFT JOIN yields a null name), so a receipt can
+  // never print a dangling "Tarpetka › ".
+  const product  = esc(productLabel(e.category_name, e.parent_name) || '?')
   const goods    = `${e.qty} dona × ${money(e.unit_price)} = ${total}`
   const note     = noteLine(e.note)
 
@@ -168,6 +272,84 @@ export function formatReceipt(entry, balance, orig = null) {
   }
 
   return `${header}\n<blockquote>${body}</blockquote>\n${balanceLine(balance)}`
+}
+
+/**
+ * One message for a whole batch: same grammar, a list where the single receipt
+ * has one product.
+ *
+ *   📦 <b>Berildi</b>
+ *   <blockquote>Tarpetka › Damas
+ *   5 dona · 600 000
+ *   !Tikuvda tarpetka💈 › Damas
+ *   2 dona · 240 000
+ *   ──────────
+ *   Jami: 840 000 so'm
+ *   14.09.2026 15:04</blockquote>
+ *   <b>Jami qarz: 3 240 000 so'm</b>
+ *
+ * THE LAYOUT DECISION (the tension the spec left open).
+ * The owner chose a "compact list, one line per product". One physical line per
+ * product is not reachable with this catalogue, and the parent is not why.
+ * Measured against the real names at a ~30-character budget (320px, Telegram's
+ * 16px body font, inside a blockquote's indent):
+ *
+ *   "Ali cantara safir dark bule (Kok)"            33 — wraps with NO parent at all
+ *   "Ali cantara safir Qora · 12 dona · 1 440 000" 44 — wraps
+ *   "!Tikuvda tarpetka💈 › Damas · 5 dona · 600 000" 45 — wraps
+ *
+ * So "render the parent more quietly" cannot save the one-line form: the LEAVES
+ * alone already spend the line. The choice is therefore between a list that
+ * wraps mid-figure — exactly the mush the owner complained about — and the
+ * invariant the previous round already established for the single receipt: the
+ * product name owns a full-width line, the figures own the line beneath. Same
+ * rule, applied to every row. A 33-character name wraps into ITSELF, harmlessly,
+ * and the arithmetic underneath is never split.
+ *
+ * "Compact" is then honoured where it is actually paid for: ONE message instead
+ * of twelve, no unit price and no repeated "so'm" per row (the Jami line carries
+ * the unit), and the qty/total line is ~16 characters. Uniform two lines for
+ * every item, never a mix — a list where some rows are one line and some are two
+ * reads as a bug, and the letters-then-digits alternation is its own row
+ * boundary, so no blank lines or bullets are needed.
+ *
+ * Size: 50 items (the API cap) ≈ 3 000 characters, inside Telegram's 4 096.
+ *
+ * @param entries  ledger rows, all the same kind (the batch routes write
+ *                 handover-only or return-only). Fewer than two delegates to
+ *                 formatReceipt, so a one-row list is unreachable from here.
+ * @param balance  the client's balance AFTER the whole batch, signed.
+ * @param opts     { note, at } — the batch's own note and stamp. Both default to
+ *                 the first row's, which is what the batch routes write.
+ */
+export function formatBatchReceipt(entries, balance, opts = {}) {
+  const list = Array.isArray(entries) ? entries.filter(Boolean) : []
+  if (list.length < 2) return formatReceipt(list[0] ?? null, balance)
+
+  const o  = opts ?? {}
+  // A batch is goods only; the fallback exists so an unknown kind still renders a
+  // receipt rather than throwing inside a fire-and-forget post().
+  const ui = KIND_UI[list[0].kind] ?? KIND_UI.handover
+
+  const rows = []
+  let grand = 0
+  for (const e of list) {
+    // Magnitudes, like the single receipt: a return prints a positive total and
+    // the verb in the header carries the direction. The bottom line is where the
+    // client sees the debt drop.
+    const amount = Math.abs(Math.trunc(Number(e.amount) || 0))
+    grand += amount
+    rows.push(esc(productLabel(e.category_name, e.parent_name) || '?'))
+    rows.push(`${e.qty} dona · ${money(amount)}`)
+  }
+
+  const note  = noteLine(o.note !== undefined ? o.note : list[0].note)
+  const stamp = tashkentStamp(o.at ?? list[0].created_at)
+
+  // The note sits in the same slot as in the single receipt — after the money,
+  // before the stamp — so the timestamp stays the last line inside the quote.
+  const body = `${rows.join('\n')}\n${RULE}\nJami: ${som(grand)}${note}\n${stamp}`
+  return `${ui.icon} <b>${ui.label}</b>\n<blockquote>${body}</blockquote>\n${balanceLine(balance)}`
 }
 
 // ─── Posting ───────────────────────────────────────────────────────────────────

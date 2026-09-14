@@ -170,6 +170,40 @@ export function postReturn(
     note ? { category_id, qty, note } : { category_id, qty })
 }
 
+/** One line of a batch. The server merges repeats of the same category_id. */
+export interface BatchItem {
+  category_id: number
+  qty: number
+}
+
+/**
+ * A batch writes one ledger row per item inside a single transaction — all of
+ * them commit or none do — and posts ONE Telegram receipt afterwards.
+ */
+export interface BatchResult {
+  entries: LedgerEntry[]
+  balance: number
+  /** Sum of the line totals, unsigned so'm. */
+  total: number
+}
+
+/** The server rejects a longer batch; the picker enforces the same cap. */
+export const MAX_BATCH_ITEMS = 50
+
+export function postHandoverBatch(
+  id: number, items: BatchItem[], note?: string
+): Promise<BatchResult> {
+  return req<BatchResult>(`/clients/${id}/handover/batch`, 'POST',
+    note ? { items, note } : { items })
+}
+
+export function postReturnBatch(
+  id: number, items: BatchItem[], note?: string
+): Promise<BatchResult> {
+  return req<BatchResult>(`/clients/${id}/return/batch`, 'POST',
+    note ? { items, note } : { items })
+}
+
 export function postPayment(
   id: number, amount: number, note?: string
 ): Promise<LedgerResult> {
