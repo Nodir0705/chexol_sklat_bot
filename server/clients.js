@@ -369,6 +369,65 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
     return reply.send(q.ledger.all(id, limit).map(r => withPath(r, byId)))
   })
 
+  // ─── Group linking (the /ulash handshake) ──────────────────────────────────
+  // The bot mints a code in the client's group; this consumes it and binds the
+  // chat. Mirrors redeem_code() in handlers/groups.py -- Node cannot call the
+  // Python one, and the `used_at IS NULL` guard (not the SELECT) is what makes a
+  // code single-use when two redeems race.
+
+  const normaliseCode = (c) => String(c ?? '').replace(/[\s-]/g, '').toUpperCase()
+
+  app.post('/api/clients/:id/link', (req, reply) => {
+    const user = requireAuth(req, reply); if (!user) return
+    const id = idParam(req.params.id)
+    if (!id) return reply.code(400).send({ error: E.badId })
+    const client = q.getClient.get(id)
+    if (!client) return reply.code(404).send({ error: E.clientNotFound })
+
+    const code = normaliseCode(req.body?.code)
+    if (!code) return reply.code(400).send({ error: 'kod kiritilmagan' })
+
+    const row = db.prepare(
+      'SELECT chat_id, title, expires_at, used_at FROM group_link_codes WHERE code = ?'
+    ).get(code)
+    if (!row)                return reply.code(404).send({ error: 'Bunday kod topilmadi.' })
+    if (row.used_at != null) return reply.code(409).send({ error: 'Bu kod allaqachon ishlatilgan.' })
+
+    // expires_at is written as UTC 'YYYY-MM-DD HH:MM:SS', which compares lexicographically.
+    const nowUtc = new Date().toISOString().slice(0, 19).replace('T', ' ')
+    if (String(row.expires_at) <= nowUtc)
+      return reply.code(409).send({ error: "Kod muddati tugagan. Guruhda /ulash ni qayta yuboring." })
+
+    db.exec('BEGIN')
+    try {
+      const consumed = db.prepare(
+        'UPDATE group_link_codes SET used_at = ? WHERE code = ? AND used_at IS NULL'
+      ).run(nowUtc, code)
+      if (consumed.changes !== 1) {
+        db.exec('ROLLBACK')
+        return reply.code(409).send({ error: 'Bu kod allaqachon ishlatilgan.' })
+      }
+      // One group per client, and one client per group.
+      db.prepare('UPDATE clients SET telegram_chat_id = NULL WHERE telegram_chat_id = ?').run(row.chat_id)
+      db.prepare('UPDATE clients SET telegram_chat_id = ? WHERE id = ?').run(row.chat_id, id)
+      db.exec('COMMIT')
+    } catch (err) {
+      db.exec('ROLLBACK')
+      return reply.code(500).send({ error: String(err) })
+    }
+
+    return reply.send({ linked: true, telegram_chat_id: row.chat_id, title: row.title ?? null })
+  })
+
+  app.delete('/api/clients/:id/link', (req, reply) => {
+    const user = requireAuth(req, reply); if (!user) return
+    const id = idParam(req.params.id)
+    if (!id) return reply.code(400).send({ error: E.badId })
+    if (!q.getClient.get(id)) return reply.code(404).send({ error: E.clientNotFound })
+    db.prepare('UPDATE clients SET telegram_chat_id = NULL WHERE id = ?').run(id)
+    return reply.send({ linked: false })
+  })
+
   // ─── Prices ─────────────────────────────────────────────────────────────────
 
   app.get('/api/clients/:id/prices', (req, reply) => {
