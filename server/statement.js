@@ -66,16 +66,55 @@ const UZ_MONTHS = [
 const KIND_LABEL = {
   handover:   'Berildi',
   return:     'Qaytarildi',
-  payment:    "To'lov",
+  payment:    "To'landi",
   adjustment: 'Tuzatish',
 }
 
-/** 2400000 -> "2 400 000" (non-breaking-space-free; matches the Mini App). */
+// The six statement lines, spelled once. The workbook rows and the Telegram
+// caption both read them from here, so the file the client opens and the
+// message sitting above it can not drift into two vocabularies for one thing.
+const LABEL = {
+  opening:  'Oy boshiga qarz',
+  given:    'Berildi',
+  returned: 'Qaytarildi',
+  paid:     "To'landi",
+  adjusted: 'Tuzatish',
+  closing:  'Oy oxiriga qarz',
+  // Only the closing line has a second spelling: a negative balance is not a
+  // debt of minus X, it is a prepayment of X, and printing it as a debt with a
+  // minus sign reads as a broken bot.
+  closingCredit: "Oy oxiriga oldindan to'lov",
+}
+
+const NBSP  = '\u00A0'  // NO-BREAK SPACE
+const MINUS = '\u2212'  // MINUS SIGN, not a hyphen
+
+/**
+ * 2400000 -> "2\u00A0400\u00A0000".
+ *
+ * Deliberately divergent from the Mini App, which separates the digit groups
+ * with an ordinary space. The caption is read on a 320px phone, where an
+ * ordinary space lets "2 400 000" break after the "2" — a debt figure torn
+ * across two lines is a trust defect. xlsx cells are untouched by this: they
+ * carry raw numbers and a numFmt (MONEY_FMT), never this string.
+ */
 function fmtMoney(n) {
   const v = Math.trunc(Number(n) || 0)
-  const sign = v < 0 ? '-' : ''
-  return sign + String(Math.abs(v)).replace(/\B(?=(\d{3})+(?!\d))/g, ' ')
+  const sign = v < 0 ? MINUS : ''
+  return sign + String(Math.abs(v)).replace(/\B(?=(\d{3})+(?!\d))/g, NBSP)
 }
+
+/** The figure with its unit, NBSP-joined so "so'm" can never orphan. */
+const som = n => `${fmtMoney(n)}${NBSP}so'm`
+
+/** Tuzatish is the one line whose label states no direction, so the figure
+ *  carries the sign itself: U+002B / U+2212, never a bare hyphen. */
+const somSigned = n => `${n < 0 ? MINUS : '+'}${fmtMoney(Math.abs(n))}${NBSP}so'm`
+
+/** The caption ships with parse_mode=HTML, so anything interpolated into it is
+ *  escaped first. This is the only HTML surface in the file. */
+const esc = v => String(v)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
 // ─── Validation ───────────────────────────────────────────────────────────────
 
@@ -305,7 +344,7 @@ function addClientSheet(wb, st, taken) {
   ws.getRow(1).font = { bold: true }
 
   const openingRow = ws.addRow({
-    kind: 'Oy boshiga qarz', name: st.period.label, sum: st.opening,
+    kind: LABEL.opening, name: st.period.label, sum: st.opening,
   })
   openingRow.font = { bold: true }
 
@@ -334,12 +373,13 @@ function addClientSheet(wb, st, taken) {
 
   const t = st.totals
   ws.addRow({})
+  // Same six strings the Telegram caption uses, from the same object.
   const summary = [
-    ['Berildi',          t.given],
-    ['Qaytarildi',       t.returned],
-    ["To'landi",         t.paid],
-    ...(t.adjusted ? [['Tuzatish', t.adjusted]] : []),
-    ['Oy oxiriga qarz',  st.closing],
+    [LABEL.given,    t.given],
+    [LABEL.returned, t.returned],
+    [LABEL.paid,     t.paid],
+    ...(t.adjusted ? [[LABEL.adjusted, t.adjusted]] : []),
+    [LABEL.closing,  st.closing],
   ]
   for (const [label, value] of summary) {
     const row = ws.addRow({ kind: label, sum: value })
@@ -382,13 +422,13 @@ export async function buildStatementsWorkbook(db, year, month) {
   // take it.
   const s = wb.addWorksheet(sheetName('Umumiy', taken))
   s.columns = [
-    { header: 'Mijoz',                 key: 'name',     width: 28 },
-    { header: "Oy boshiga qarz",       key: 'opening',  width: 20 },
-    { header: 'Berildi',               key: 'given',    width: 18 },
-    { header: 'Qaytarildi',            key: 'returned', width: 18 },
-    { header: "To'landi",              key: 'paid',     width: 18 },
-    { header: 'Tuzatish',              key: 'adjusted', width: 16 },
-    { header: "Oy oxiriga qarz",       key: 'closing',  width: 20 },
+    { header: 'Mijoz',          key: 'name',     width: 28 },
+    { header: LABEL.opening,    key: 'opening',  width: 20 },
+    { header: LABEL.given,      key: 'given',    width: 18 },
+    { header: LABEL.returned,   key: 'returned', width: 18 },
+    { header: LABEL.paid,       key: 'paid',     width: 18 },
+    { header: LABEL.adjusted,   key: 'adjusted', width: 16 },
+    { header: LABEL.closing,    key: 'closing',  width: 20 },
   ]
   s.getRow(1).font = { bold: true }
 
@@ -435,13 +475,13 @@ async function buildSingleWorkbook(st) {
 
   const s = wb.addWorksheet(sheetName('Umumiy', taken))
   s.columns = [
-    { header: 'Mijoz',           key: 'name',     width: 28 },
-    { header: "Oy boshiga qarz", key: 'opening',  width: 20 },
-    { header: 'Berildi',         key: 'given',    width: 18 },
-    { header: 'Qaytarildi',      key: 'returned', width: 18 },
-    { header: "To'landi",        key: 'paid',     width: 18 },
-    { header: 'Tuzatish',        key: 'adjusted', width: 16 },
-    { header: "Oy oxiriga qarz", key: 'closing',  width: 20 },
+    { header: 'Mijoz',        key: 'name',     width: 28 },
+    { header: LABEL.opening,  key: 'opening',  width: 20 },
+    { header: LABEL.given,    key: 'given',    width: 18 },
+    { header: LABEL.returned, key: 'returned', width: 18 },
+    { header: LABEL.paid,     key: 'paid',     width: 18 },
+    { header: LABEL.adjusted, key: 'adjusted', width: 16 },
+    { header: LABEL.closing,  key: 'closing',  width: 20 },
   ]
   s.getRow(1).font = { bold: true }
   s.addRow({
@@ -459,6 +499,51 @@ async function buildSingleWorkbook(st) {
 
   addClientSheet(wb, st, taken)
   return wb
+}
+
+/**
+ * The sendDocument caption — the whole statement in six lines, so a client can
+ * check the month on a lock screen and only open the workbook to see the rows.
+ *
+ * The figures are the arithmetic of the bold bottom line:
+ *
+ *   opening + Berildi − Qaytarildi − To'landi (+ Tuzatish) = closing
+ *
+ * which holds by construction — `closing` is `opening` plus every amount that
+ * moved in the month, and the four buckets partition exactly those amounts
+ * (assemble(), :211-221). That is why the operands keep their signs: a
+ * September reversal of an August handover makes `given` negative, and hiding
+ * that minus would print a sum that does not add up. Only the closing line
+ * refuses a sign, because a negative balance is not a debt — it is a
+ * prepayment, and it says so.
+ *
+ * Tuzatish appears the moment it is non-zero (mirroring the workbook summary);
+ * the other four print even at zero, because a statement of account states
+ * every line.
+ *
+ * Requires parse_mode=HTML on the request, or the tags ship as literal text.
+ */
+export function statementCaption(st) {
+  const t = st.totals
+
+  const quote = [
+    `${LABEL.opening}: ${som(st.opening)}`,
+    `${LABEL.given}: ${som(t.given)}`,
+    `${LABEL.returned}: ${som(t.returned)}`,
+    `${LABEL.paid}: ${som(t.paid)}`,
+  ]
+  if (t.adjusted !== 0) quote.push(`${LABEL.adjusted}: ${somSigned(t.adjusted)}`)
+
+  const bottom = st.closing < 0
+    ? `${LABEL.closingCredit}: ${som(-st.closing)}`
+    : `${LABEL.closing}: ${som(st.closing)}`
+
+  // `st.period.label` is generated from UZ_MONTHS, never user input, but it is
+  // escaped anyway: the day someone makes the label configurable, this line
+  // should not be the one that starts rejecting messages.
+  return `📄 <b>${esc(st.period.label)} hisoboti</b>\n` +
+         `<blockquote>${quote.join('\n')}</blockquote>\n` +
+         `<b>${bottom}</b>`
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -516,17 +601,12 @@ export default async function statementRoutes(app, { db, requireAuth, requireRea
       const wb  = await buildSingleWorkbook(st)
       const buf = await wb.xlsx.writeBuffer()
 
-      const caption =
-        `📄 ${st.client.name} — ${st.period.label} hisoboti\n` +
-        `📥 Oy boshiga qarz: ${fmtMoney(st.opening)} so'm\n` +
-        `📦 Berildi: ${fmtMoney(st.totals.given)} so'm\n` +
-        `↩️ Qaytarildi: ${fmtMoney(st.totals.returned)} so'm\n` +
-        `💵 To'landi: ${fmtMoney(st.totals.paid)} so'm\n` +
-        `💰 Oy oxiriga qarz: ${fmtMoney(st.closing)} so'm`
-
       const form = new FormData()
       form.append('chat_id', String(st.client.telegram_chat_id))
-      form.append('caption', caption)
+      form.append('caption', statementCaption(st))
+      // Without this the caption's <b> and <blockquote> arrive as literal
+      // "&lt;b&gt;" text. Telegram defaults to no parse mode.
+      form.append('parse_mode', 'HTML')
       form.append('document', new Blob([buf],
         { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
         statementFileName(st))

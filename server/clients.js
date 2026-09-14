@@ -13,6 +13,7 @@
 // All money is integer so'm — no floats anywhere in the money path.
 
 import { migrate } from './schema.js'
+import { formatReceipt } from './notify.js'
 
 const MAX_QTY   = 99999          // matches the Mini App's quantity input cap
 const MAX_MONEY = 10_000_000_000 // so'm; qty*unit_price stays well under 2^53
@@ -204,57 +205,22 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
   // Posting never blocks the ledger write: the row is committed first, the post
   // is fired afterwards and its failure can only reach the log, never the reply.
 
-  function money(n) {
-    const neg = n < 0
-    const s = String(Math.abs(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ' ')
-    return neg ? `-${s}` : s
-  }
-
-  function tashkentStr(utc) {
-    const d = new Date(String(utc ?? '').replace(' ', 'T') + 'Z')
-    const ms = Number.isNaN(d.getTime()) ? Date.now() : d.getTime()
-    const t = new Date(ms + 5 * 60 * 60 * 1000)
-    const p = n => String(n).padStart(2, '0')
-    return `${p(t.getUTCDate())}.${p(t.getUTCMonth() + 1)}.${t.getUTCFullYear()} ${p(t.getUTCHours())}:${p(t.getUTCMinutes())}`
-  }
-
-  function receipt(headline, entry, balance) {
-    return [
-      headline,
-      `📅 ${tashkentStr(entry.created_at)}`,
-      `💰 Umumiy qarz: ${money(balance)} so'm`,
-    ].join('\n')
-  }
-
-  // Receipts are sent with parse_mode: 'HTML', so anything interpolated from the
-  // database must be escaped. A category named "Qora & Oq" would otherwise make
-  // Telegram reject the whole message, and the client would silently never see
-  // a receipt while the ledger looked perfectly healthy.
-  const esc = (v) => String(v)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-
-  function lineFor(entry) {
-    const name = esc(entry.category_name ?? '?')
-    return `${name} — ${entry.qty} dona × ${money(entry.unit_price)} = ${money(Math.abs(entry.amount))} so'm`
-  }
-
-  function headlineFor(entry) {
-    if (entry.reverses_id != null) return `❌ Bekor qilindi: ${
-      entry.kind === 'payment' ? `${money(Math.abs(entry.amount))} so'm` : lineFor(entry)
-    }`
-    if (entry.kind === 'handover') return `📦 Berildi: ${lineFor(entry)}`
-    if (entry.kind === 'return')   return `↩️ Qaytarildi: ${lineFor(entry)}`
-    if (entry.kind === 'payment')  return `💵 To'lov: ${money(Math.abs(entry.amount))} so'm`
-    return `✏️ Tuzatish: ${money(entry.amount)} so'm`
-  }
+  // The message itself is built by formatReceipt in server/notify.js — the one
+  // renderer. This file deliberately keeps no formatting helpers of its own:
+  // when it carried a parallel copy, the two drifted, and only one of them
+  // escaped the owner-entered text it interpolated into an HTML-parsed message.
+  //
+  // `orig` is passed only for a reversal: the receipt quotes the cancelled row's
+  // label and stamp, and the reverse route already holds that row, so nothing
+  // here re-reads it.
 
   /** Fire-and-forget. Swallows everything — a Telegram outage must not stop the
    *  owner recording business, and the row is already committed by now. */
-  function post(client, entry, balance) {
+  function post(client, entry, balance, orig = null) {
     if (typeof notify !== 'function') return
     if (!client || client.telegram_chat_id == null) return
     try {
-      Promise.resolve(notify(client.telegram_chat_id, receipt(headlineFor(entry), entry, balance)))
+      Promise.resolve(notify(client.telegram_chat_id, formatReceipt(entry, balance, orig)))
         .catch(() => {})
     } catch {}
   }
@@ -633,13 +599,15 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
           user?.id ?? null, user?.first_name ?? user?.username ?? null,
           entryId,
         )
-        return { code: 200, id: q.lastId.get().id, client }
+        // The cancelled row travels with the result: the receipt quotes its
+        // label and its timestamp, and it is already in hand here.
+        return { code: 200, id: q.lastId.get().id, client, orig }
       })
       if (out.code !== 200) return reply.code(out.code).send(out.body)
 
       const entry   = withPath(q.entry.get(out.id))
       const balance = balanceOf(out.client.id)
-      post(out.client, entry, balance)
+      post(out.client, entry, balance, out.orig)
       return reply.send({ entry, balance })
     } catch (err) {
       return reply.code(500).send({ error: String(err) })
