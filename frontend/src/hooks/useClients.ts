@@ -2,10 +2,14 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   fetchClients, fetchClient, createClient, updateClient, deleteClient,
   fetchLedger, postHandover, postReturn, postPayment, reverseEntry,
+  postHandoverBatch, postReturnBatch,
   fetchClientPrices, setClientPrice, removeClientPrice,
   fetchStatement, sendStatement, linkGroup, unlinkGroup,
 } from '../api/clients'
-import type { Client, ClientPrice, ClientRef, LedgerEntry, LedgerResult, LinkResult, Statement } from '../api/clients'
+import type {
+  BatchItem, BatchResult, Client, ClientPrice, ClientRef,
+  LedgerEntry, LedgerResult, LinkResult, Statement,
+} from '../api/clients'
 
 // ─── Query keys ───────────────────────────────────────────────────────────────
 
@@ -117,6 +121,26 @@ export function useReturnGoods(clientId: number) {
   const invalidate = useLedgerInvalidation(clientId)
   return useMutation<LedgerResult, Error, GoodsVars>({
     mutationFn: ({ category_id, qty, note }) => postReturn(clientId, category_id, qty, note),
+    onSuccess: invalidate,
+  })
+}
+
+export interface BatchVars { items: BatchItem[]; note?: string }
+
+/** Several products handed over at once — one transaction, one receipt. */
+export function useHandoverBatch(clientId: number) {
+  const invalidate = useLedgerInvalidation(clientId)
+  return useMutation<BatchResult, Error, BatchVars>({
+    mutationFn: ({ items, note }) => postHandoverBatch(clientId, items, note),
+    onSuccess: invalidate,
+  })
+}
+
+/** Several products returned at once — one transaction, one receipt. */
+export function useReturnBatch(clientId: number) {
+  const invalidate = useLedgerInvalidation(clientId)
+  return useMutation<BatchResult, Error, BatchVars>({
+    mutationFn: ({ items, note }) => postReturnBatch(clientId, items, note),
     onSuccess: invalidate,
   })
 }

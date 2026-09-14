@@ -3,12 +3,12 @@ import { useTree } from '../hooks/useWarehouse'
 import { haptic, useBackButton } from '../hooks/useTelegram'
 import {
   useClient, useLedger, useClientPrices, useStatement,
-  useHandover, useReturnGoods, usePayment, useReverseEntry,
+  useHandoverBatch, useReturnBatch, usePayment, useReverseEntry,
   useSetClientPrice, useRemoveClientPrice, useSendStatement,
   useLinkGroup,
   useUnlinkGroup,
 } from '../hooks/useClients'
-import { formatMoney, formatSignedMoney, groupDigits } from '../api/clients'
+import { formatMoney, formatSignedMoney, groupDigits, MAX_BATCH_ITEMS } from '../api/clients'
 import type { ClientPrice, LedgerEntry, LedgerKind, Statement } from '../api/clients'
 import type { TreeNode } from '../types'
 
@@ -358,20 +358,37 @@ function LedgerTab({ clientId }: { clientId: number }) {
   )
 }
 
-// ─── Product picker (the ActionPage tree, priced per client) ───────────────────
+// ─── Product picker (the ActionPage tree, priced per client, multi-select) ─────
 
-function PickerRow({ node, price, onPick }: {
+function CheckBox({ checked, tone }: { checked: boolean; tone: string }) {
+  return (
+    <span className="w-5 h-5 rounded-md shrink-0 flex items-center justify-center text-xs font-bold leading-none"
+          style={checked
+            ? { background: tone, color: '#fff' }
+            : { border: '2px solid rgba(128,128,128,.35)' }}>
+      {checked ? '✓' : ''}
+    </span>
+  )
+}
+
+function PickerRow({ node, price, tone, checked, atLimit, onToggle }: {
   node: TreeNode
   price: ClientPrice | undefined
-  onPick: (id: number) => void
+  tone: string
+  checked: boolean
+  /** The batch is full — tapping an unchecked row explains instead of selecting. */
+  atLimit: boolean
+  onToggle: (id: number) => void
 }) {
   const unitPrice = price?.unit_price ?? null
+  const dimmed = atLimit && !checked
   return (
-    <button onClick={() => { haptic('light'); onPick(node.id) }}
-            className="w-full flex items-center justify-between py-3 pl-4 pr-3 active:opacity-60 transition-opacity text-left">
-      <div className="flex items-center gap-2 min-w-0">
-        <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: ACCENT, opacity: .5 }} />
-        <span className="text-sm truncate">{node.name}</span>
+    <button onClick={() => onToggle(node.id)}
+            className={`w-full flex items-center justify-between py-3 pl-4 pr-3 active:opacity-60 transition-opacity text-left ${dimmed ? 'opacity-40' : ''}`}
+            style={{ background: checked ? 'rgba(128,128,128,.10)' : 'transparent' }}>
+      <div className="flex items-center gap-2.5 min-w-0">
+        <CheckBox checked={checked} tone={tone} />
+        <span className={`text-sm truncate ${checked ? 'font-semibold' : ''}`}>{node.name}</span>
       </div>
       <div className="flex items-center gap-2 ml-3 shrink-0">
         <span className="text-sm px-2.5 py-0.5 rounded-full font-semibold whitespace-nowrap"
@@ -380,37 +397,50 @@ function PickerRow({ node, price, onPick }: {
                 : { background: 'rgba(239,68,68,.1)', color: RED }}>
           {unitPrice !== null ? formatMoney(unitPrice) : 'Narx yo\'q'}
         </span>
-        <span style={{ color: 'var(--tg-theme-hint-color)' }}>›</span>
       </div>
     </button>
   )
 }
 
-function PickerGroup({ models, priceById, onPick }: {
-  models: TreeNode[]
+interface PickerShared {
   priceById: Map<number, ClientPrice>
-  onPick: (id: number) => void
-}) {
+  tone: string
+  checkedIds: ReadonlySet<number>
+  atLimit: boolean
+  onToggle: (id: number) => void
+}
+
+function PickerGroup({ models, ...shared }: { models: TreeNode[] } & PickerShared) {
   return (
     <div className="ml-4 mb-2 rounded-xl overflow-hidden"
          style={{ borderLeft: `2px solid ${ACCENT}`, background: 'rgba(128,128,128,.04)' }}>
       {models.map((m, i) => (
         <div key={m.id}>
           {i > 0 && <div className="h-px ml-4" style={{ background: 'rgba(128,128,128,.12)' }} />}
-          <PickerRow node={m} price={priceById.get(m.id)} onPick={onPick} />
+          <PickerRow node={m} price={shared.priceById.get(m.id)} tone={shared.tone}
+                     checked={shared.checkedIds.has(m.id)} atLimit={shared.atLimit}
+                     onToggle={shared.onToggle} />
         </div>
       ))}
     </div>
   )
 }
 
-function PickerCard({ root, priceById, onPick }: {
-  root: TreeNode
-  priceById: Map<number, ClientPrice>
-  onPick: (id: number) => void
-}) {
+function PickerCard({ root, ...shared }: { root: TreeNode } & PickerShared) {
   const directLeaves = root.children.filter(c => c.children.length === 0)
   const subTurs      = root.children.filter(c => c.children.length > 0)
+
+  // How many of this card's leaves are already ticked — so a collapsed glance
+  // down the page still shows where the selection lives.
+  const pickedHere = useMemo(() => {
+    let n = 0
+    const walk = (node: TreeNode) => {
+      if (node.children.length === 0) { if (shared.checkedIds.has(node.id)) n++; return }
+      for (const c of node.children) walk(c)
+    }
+    walk(root)
+    return n
+  }, [root, shared.checkedIds])
 
   return (
     <div className="mx-3 mb-3 rounded-2xl overflow-hidden shadow-sm"
@@ -420,6 +450,12 @@ function PickerCard({ root, priceById, onPick }: {
         <div className="flex items-center gap-2 font-bold text-sm tracking-wide min-w-0">
           <span>📁</span><span className="truncate">{root.name.toUpperCase()}</span>
         </div>
+        {pickedHere > 0 && (
+          <span className="text-xs font-bold px-2.5 py-0.5 rounded-full ml-3 shrink-0"
+                style={{ background: shared.tone, color: '#fff' }}>
+            {pickedHere} ta
+          </span>
+        )}
       </div>
 
       <div className="py-1" style={{ background: 'var(--tg-theme-bg-color)' }}>
@@ -430,7 +466,7 @@ function PickerCard({ root, priceById, onPick }: {
         )}
 
         {directLeaves.length > 0 && (
-          <div className="py-1"><PickerGroup models={directLeaves} priceById={priceById} onPick={onPick} /></div>
+          <div className="py-1"><PickerGroup models={directLeaves} {...shared} /></div>
         )}
 
         {subTurs.map(sub => (
@@ -442,7 +478,7 @@ function PickerCard({ root, priceById, onPick }: {
                 ({sub.children.length})
               </span>
             </div>
-            <PickerGroup models={sub.children} priceById={priceById} onPick={onPick} />
+            <PickerGroup models={sub.children} {...shared} />
           </div>
         ))}
       </div>
@@ -450,7 +486,124 @@ function PickerCard({ root, priceById, onPick }: {
   )
 }
 
+// ─── Quantity stepper (same input rules as ActionPage) ────────────────────────
+
+function QtyStepper({ qty, tone, large, onChange }: {
+  qty: number
+  tone: string
+  /** A single picked product gets the full-size control the old sheet had. */
+  large: boolean
+  onChange: (next: number) => void
+}) {
+  const size   = large ? 'w-14 h-14 text-3xl' : 'w-11 h-11 text-2xl'
+  const field  = large ? 'w-24 text-3xl' : 'w-16 text-2xl'
+  return (
+    <div className={`flex items-center justify-center ${large ? 'gap-5' : 'gap-3'}`}>
+      <button onClick={() => { haptic('light'); onChange(Math.max(1, qty - 1)) }}
+              className={`${size} rounded-full font-bold active:scale-90 transition-transform`}
+              style={{ background: 'var(--tg-theme-bg-color)' }}>−</button>
+      <input type="text" inputMode="numeric"
+             value={qty === 0 ? '' : String(qty)}
+             onChange={e => {
+               const digits = e.target.value.replace(/[^0-9]/g, '')
+               onChange(digits === '' ? 0 : Math.min(MAX_QTY, Number(digits)))
+             }}
+             onBlur={() => { if (qty === 0) onChange(1) }}
+             className={`${field} text-center font-bold bg-transparent border-b-2 outline-none`}
+             style={{ borderColor: tone, color: 'var(--tg-theme-text-color)' }} />
+      <button onClick={() => { haptic('light'); onChange(Math.min(MAX_QTY, qty + 1)) }}
+              className={`${size} rounded-full font-bold active:scale-90 transition-transform`}
+              style={{ background: 'var(--tg-theme-bg-color)' }}>+</button>
+    </div>
+  )
+}
+
 // ─── Berish / Qaytarish sheet ─────────────────────────────────────────────────
+// Two steps: tick the products, then set every quantity and send once. The
+// whole basket goes to the batch endpoint in a single request — including a
+// basket of one, so the server owns the one-item-vs-list receipt shape.
+
+/** One line of the basket, resolved against the client's price list. */
+interface BasketLine {
+  categoryId: number
+  name: string
+  path: string | null
+  unitPrice: number | null
+  isOverride: boolean
+  qty: number
+  /** null when the price does not resolve — such a line blocks the send. */
+  total: number | null
+}
+
+/** BottomNav is z-50 and later in the DOM, so it paints over this sheet. */
+const NAV_GAP = 'calc(env(safe-area-inset-bottom, 0px) + 64px)'
+
+function BasketRow({ line, tone, solo, onQty, onRemove }: {
+  line: BasketLine
+  tone: string
+  solo: boolean
+  onQty: (id: number, next: number) => void
+  onRemove: (id: number) => void
+}) {
+  const blocked = line.unitPrice === null
+  return (
+    <div className="rounded-2xl p-4 space-y-3"
+         style={{ background: 'var(--tg-theme-secondary-bg-color)',
+                  border: blocked ? `1px solid ${RED}` : '1px solid transparent' }}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          {line.path && (
+            <p className="text-xs truncate" style={{ color: 'var(--tg-theme-hint-color)' }}>
+              📍 {line.path}
+            </p>
+          )}
+          <p className="font-semibold truncate">{line.name}</p>
+          <p className="text-sm mt-0.5 whitespace-nowrap"
+             style={{ color: blocked ? RED : 'var(--tg-theme-hint-color)' }}>
+            {blocked
+              ? 'narx belgilanmagan'
+              : `Narx: ${formatMoney(line.unitPrice ?? 0)}${line.isOverride ? ' (shaxsiy)' : ''}`}
+          </p>
+        </div>
+        <button onClick={() => onRemove(line.categoryId)}
+                className="text-2xl shrink-0 leading-none"
+                style={{ color: 'var(--tg-theme-hint-color)' }}>✕</button>
+      </div>
+
+      {blocked ? (
+        <p className="text-xs" style={{ color: RED }}>
+          Avval "Narxlar" bo'limidan narx belgilang yoki bu mahsulotni ro'yxatdan olib tashlang
+        </p>
+      ) : (
+        <>
+          <QtyStepper qty={line.qty} tone={tone} large={solo}
+                      onChange={(next) => onQty(line.categoryId, next)} />
+          {solo && (
+            <div className="flex flex-wrap gap-2 justify-center">
+              {[1, 2, 5, 10, 20, 50].map(n => (
+                <button key={n} onClick={() => { haptic('light'); onQty(line.categoryId, n) }}
+                        className="px-4 py-2 rounded-full text-sm font-semibold transition-all active:scale-95"
+                        style={line.qty === n
+                          ? { background: tone, color: '#fff' }
+                          : { background: 'var(--tg-theme-bg-color)', color: 'var(--tg-theme-text-color)' }}>
+                  {n}
+                </button>
+              ))}
+            </div>
+          )}
+          <div className="flex items-center justify-between pt-1">
+            <span className="text-xs" style={{ color: 'var(--tg-theme-hint-color)' }}>
+              {line.qty} dona
+            </span>
+            <span className="font-bold text-sm whitespace-nowrap" style={{ color: tone }}>
+              {line.total === null ? '—' : formatMoney(line.total)}
+            </span>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
 
 function GoodsSheet({ clientId, clientName, kind, onClose }: {
   clientId: number
@@ -460,18 +613,20 @@ function GoodsSheet({ clientId, clientName, kind, onClose }: {
 }) {
   const isHandover = kind === 'handover'
   const tone = isHandover ? RED : GREEN
-  const title = isHandover ? 'Berish' : 'Qaytarish'
 
   const tree   = useTree()
   const prices = useClientPrices(clientId)
-  const handover = useHandover(clientId)
-  const returns  = useReturnGoods(clientId)
-  const mut = isHandover ? handover : returns
+  const handoverBatch = useHandoverBatch(clientId)
+  const returnBatch   = useReturnBatch(clientId)
+  const mut = isHandover ? handoverBatch : returnBatch
 
-  const [selectedId, setSelectedId] = useState<number | null>(null)
-  const [qty, setQty] = useState(1)
+  const [step, setStep] = useState<'pick' | 'qty'>('pick')
+  /** Pick order, so the basket reads in the order the owner tapped. */
+  const [pickedIds, setPickedIds] = useState<number[]>([])
+  const [qtyById, setQtyById] = useState<Record<number, number | undefined>>({})
   const [note, setNote] = useState('')
   const [err, setErr] = useState<string | null>(null)
+  const [limitHit, setLimitHit] = useState(false)
 
   const priceById = useMemo(() => {
     const map = new Map<number, ClientPrice>()
@@ -479,26 +634,92 @@ function GoodsSheet({ clientId, clientName, kind, onClose }: {
     return map
   }, [prices.data])
 
-  const picked    = selectedId === null ? undefined : priceById.get(selectedId)
-  const pickedLeaf = selectedId === null
-    ? undefined
-    : tree.data?.leaves.find(l => l.id === selectedId)
-  const pickedName = picked?.name ?? pickedLeaf?.name ?? ''
-  const unitPrice  = picked?.unit_price ?? null
-  const total      = unitPrice === null ? null : unitPrice * qty
+  // The price list is the naming authority; the tree covers any leaf it misses.
+  const leafNameById = useMemo(() => {
+    const map = new Map<number, string>()
+    for (const l of tree.data?.leaves ?? []) map.set(l.id, l.name)
+    return map
+  }, [tree.data])
+
+  const pickedSet = useMemo(() => new Set(pickedIds), [pickedIds])
+
+  const lines = useMemo<BasketLine[]>(() => pickedIds.map(id => {
+    const price = priceById.get(id)
+    const qty = qtyById[id] ?? 1
+    const unitPrice = price?.unit_price ?? null
+    return {
+      categoryId: id,
+      name: price?.name ?? leafNameById.get(id) ?? '—',
+      path: price?.path ?? null,
+      unitPrice,
+      isOverride: price?.is_override ?? false,
+      qty,
+      total: unitPrice === null ? null : unitPrice * qty,
+    }
+  }), [pickedIds, qtyById, priceById, leafNameById])
+
+  const blockedCount = lines.filter(l => l.unitPrice === null).length
+  const emptyQty     = lines.some(l => l.qty < 1)
+  const grandTotal   = lines.reduce((sum, l) => sum + (l.total ?? 0), 0)
+  const totalPieces  = lines.reduce((sum, l) => sum + l.qty, 0)
+  const canSend      = lines.length > 0 && blockedCount === 0 && !emptyQty && !mut.isPending
+
+  const toggle = useCallback((id: number) => {
+    setErr(null)
+    if (pickedSet.has(id)) {
+      haptic('light')
+      setLimitHit(false)
+      setPickedIds(ids => ids.filter(x => x !== id))
+      setQtyById(prev => {
+        const next = { ...prev }
+        delete next[id]
+        return next
+      })
+      return
+    }
+    if (pickedIds.length >= MAX_BATCH_ITEMS) {
+      haptic('error')
+      setLimitHit(true)
+      return
+    }
+    haptic('light')
+    setLimitHit(false)
+    setPickedIds(ids => [...ids, id])
+    setQtyById(prev => ({ ...prev, [id]: prev[id] ?? 1 }))
+  }, [pickedIds, pickedSet])
+
+  const setQty = useCallback((id: number, next: number) => {
+    setQtyById(prev => ({ ...prev, [id]: next }))
+  }, [])
+
+  // Dropping the last line has nowhere to stand, so it walks back to the tree.
+  const removeLine = useCallback((id: number) => {
+    toggle(id)
+    if (pickedIds.length <= 1) setStep('pick')
+  }, [toggle, pickedIds])
 
   const retry = () => {
     if (tree.isError) void tree.refetch()
     if (prices.isError) void prices.refetch()
   }
 
+  const goToQty = () => {
+    if (pickedIds.length === 0) return
+    haptic('medium')
+    setErr(null)
+    setStep('qty')
+  }
+
   const submit = () => {
-    if (selectedId === null || qty < 1 || unitPrice === null || mut.isPending) return
+    if (!canSend) return
     haptic('medium')
     setErr(null)
     const trimmed = note.trim()
     mut.mutate(
-      { category_id: selectedId, qty, note: trimmed === '' ? undefined : trimmed },
+      {
+        items: lines.map(l => ({ category_id: l.categoryId, qty: l.qty })),
+        note: trimmed === '' ? undefined : trimmed,
+      },
       {
         onSuccess: () => { haptic('success'); onClose() },
         onError: (e) => { haptic('error'); setErr(errText(e)) },
@@ -506,9 +727,10 @@ function GoodsSheet({ clientId, clientName, kind, onClose }: {
     )
   }
 
-  const roots = tree.data?.tree ?? []
-  const busy  = tree.isLoading || prices.isLoading
+  const roots  = tree.data?.tree ?? []
+  const busy   = tree.isLoading || prices.isLoading
   const failed = tree.isError || prices.isError
+  const showPickBar = step === 'pick' && !busy && !failed && roots.length > 0
 
   return (
     <div className="fixed inset-0 z-50 overflow-y-auto"
@@ -517,23 +739,36 @@ function GoodsSheet({ clientId, clientName, kind, onClose }: {
       <div className="sticky top-0 z-10 px-4 py-3 flex items-center justify-between"
            style={{ background: 'var(--tg-theme-secondary-bg-color)',
                     borderBottom: '1px solid rgba(128,128,128,.12)' }}>
-        <div className="min-w-0">
-          <p className="font-bold text-base" style={{ color: tone }}>
-            {isHandover ? '📦 Berish' : '↩️ Qaytarish'}
-          </p>
-          <p className="text-xs truncate" style={{ color: 'var(--tg-theme-hint-color)' }}>
-            {clientName}
-          </p>
+        <div className="flex items-center gap-2 min-w-0">
+          {step === 'qty' && (
+            /* Back to the tree with the ticks and the quantities still set. */
+            <button onClick={() => { haptic('light'); setStep('pick') }}
+                    className="w-9 h-9 rounded-xl shrink-0 flex items-center justify-center text-lg active:scale-90 transition-transform"
+                    style={{ background: 'var(--tg-theme-bg-color)' }}>‹</button>
+          )}
+          <div className="min-w-0">
+            <p className="font-bold text-base" style={{ color: tone }}>
+              {isHandover ? '📦 Berish' : '↩️ Qaytarish'}
+            </p>
+            <p className="text-xs truncate" style={{ color: 'var(--tg-theme-hint-color)' }}>
+              {clientName} • {step === 'pick' ? '1/2 Tanlash' : '2/2 Miqdor'}
+            </p>
+          </div>
         </div>
         <button onClick={onClose} className="text-2xl ml-3 shrink-0"
                 style={{ color: 'var(--tg-theme-hint-color)' }}>✕</button>
       </div>
 
       {/* BottomNav shares this z-index and sits later in the DOM, so leave room
-          for it rather than letting it cover the confirm button. */}
-      <div className="pt-3" style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 110px)' }}>
-        {/* ── Step 1: pick a product ── */}
-        {selectedId === null && (
+          for it — and for the selection bar — rather than letting either cover
+          the content. */}
+      <div className="pt-3"
+           style={{ paddingBottom: showPickBar
+             ? 'calc(env(safe-area-inset-bottom, 0px) + 190px)'
+             : 'calc(env(safe-area-inset-bottom, 0px) + 110px)' }}>
+
+        {/* ── Step 1: tick the products ── */}
+        {step === 'pick' && (
           <>
             {busy && <CardSkeleton rows={4} />}
             {!busy && failed && (
@@ -545,69 +780,28 @@ function GoodsSheet({ clientId, clientName, kind, onClose }: {
                           hint={'"Mahsulotlar" bo\'limidan mahsulot qo\'shing'} />
             )}
             {!busy && !failed && roots.map(root => (
-              <PickerCard key={root.id} root={root} priceById={priceById}
-                          onPick={(id) => { setSelectedId(id); setQty(1) }} />
+              <PickerCard key={root.id} root={root} priceById={priceById} tone={tone}
+                          checkedIds={pickedSet}
+                          atLimit={pickedIds.length >= MAX_BATCH_ITEMS}
+                          onToggle={toggle} />
             ))}
           </>
         )}
 
-        {/* ── Step 2: quantity + total ── */}
-        {selectedId !== null && (
+        {/* ── Step 2: a quantity per product, then one send ── */}
+        {step === 'qty' && (
           <div className="mx-3 space-y-3">
-            <div className="rounded-2xl px-4 py-3 flex items-center justify-between"
-                 style={{ background: 'var(--tg-theme-secondary-bg-color)' }}>
-              <div className="min-w-0">
-                {picked?.path && (
-                  <p className="text-xs truncate" style={{ color: 'var(--tg-theme-hint-color)' }}>
-                    📍 {picked.path}
-                  </p>
-                )}
-                <p className="font-semibold truncate">{pickedName}</p>
-                <p className="text-sm mt-0.5 whitespace-nowrap"
-                   style={{ color: unitPrice === null ? RED : 'var(--tg-theme-hint-color)' }}>
-                  {unitPrice === null
-                    ? 'Narx belgilanmagan'
-                    : `Narx: ${formatMoney(unitPrice)}${picked?.is_override ? ' (shaxsiy)' : ''}`}
-                </p>
-              </div>
-              <button onClick={() => setSelectedId(null)}
-                      className="text-2xl ml-3 shrink-0"
-                      style={{ color: 'var(--tg-theme-hint-color)' }}>✕</button>
-            </div>
+            {lines.map(line => (
+              <BasketRow key={line.categoryId} line={line} tone={tone}
+                         solo={lines.length === 1}
+                         onQty={setQty} onRemove={removeLine} />
+            ))}
 
-            {/* Quantity stepper — same input rules as the warehouse page */}
-            <div className="rounded-2xl p-4 space-y-4"
-                 style={{ background: 'var(--tg-theme-secondary-bg-color)' }}>
-              <div className="flex items-center justify-center gap-5">
-                <button onClick={() => setQty(q => Math.max(1, q - 1))}
-                        className="w-14 h-14 rounded-full text-3xl font-bold active:scale-90 transition-transform"
-                        style={{ background: 'var(--tg-theme-bg-color)' }}>−</button>
-                <input type="text" inputMode="numeric"
-                       value={qty === 0 ? '' : String(qty)}
-                       onChange={e => {
-                         const digits = e.target.value.replace(/[^0-9]/g, '')
-                         setQty(digits === '' ? 0 : Math.min(MAX_QTY, Number(digits)))
-                       }}
-                       onBlur={() => { if (qty === 0) setQty(1) }}
-                       className="w-24 text-center text-3xl font-bold bg-transparent border-b-2 outline-none"
-                       style={{ borderColor: tone }} />
-                <button onClick={() => setQty(q => Math.min(MAX_QTY, q + 1))}
-                        className="w-14 h-14 rounded-full text-3xl font-bold active:scale-90 transition-transform"
-                        style={{ background: 'var(--tg-theme-bg-color)' }}>+</button>
-              </div>
-
-              <div className="flex flex-wrap gap-2 justify-center">
-                {[1, 2, 5, 10, 20, 50].map(n => (
-                  <button key={n} onClick={() => { setQty(n); haptic('light') }}
-                          className="px-4 py-2 rounded-full text-sm font-semibold transition-all active:scale-95"
-                          style={qty === n
-                            ? { background: tone, color: '#fff' }
-                            : { background: 'var(--tg-theme-bg-color)', color: 'var(--tg-theme-text-color)' }}>
-                    {n}
-                  </button>
-                ))}
-              </div>
-            </div>
+            <button onClick={() => { haptic('light'); setStep('pick') }}
+                    className="w-full py-3 rounded-2xl font-semibold text-sm active:scale-95 transition-all"
+                    style={{ background: 'var(--tg-theme-secondary-bg-color)', color: ACCENT }}>
+              ＋ Yana mahsulot tanlash
+            </button>
 
             {/* Optional note */}
             <input value={note} onChange={e => setNote(e.target.value)}
@@ -616,34 +810,68 @@ function GoodsSheet({ clientId, clientName, kind, onClose }: {
                    style={{ background: 'var(--tg-theme-secondary-bg-color)',
                             color: 'var(--tg-theme-text-color)' }} />
 
-            {/* Live total */}
+            {/* Grand total */}
             <div className="rounded-2xl px-4 py-3.5 flex items-center justify-between"
                  style={{ background: 'var(--tg-theme-secondary-bg-color)' }}>
-              <span className="text-sm" style={{ color: 'var(--tg-theme-hint-color)' }}>
-                Jami {isHandover ? 'qarzga' : 'qarzdan'}
-              </span>
-              <span className="font-bold text-lg whitespace-nowrap" style={{ color: tone }}>
-                {total === null ? '—' : `${isHandover ? '+' : '−'}${formatMoney(total)}`}
+              <div className="min-w-0">
+                <p className="text-sm" style={{ color: 'var(--tg-theme-hint-color)' }}>
+                  Jami {isHandover ? 'qarzga' : 'qarzdan'}
+                </p>
+                <p className="text-xs" style={{ color: 'var(--tg-theme-hint-color)' }}>
+                  {lines.length} ta mahsulot • {totalPieces} dona
+                </p>
+              </div>
+              <span className="font-bold text-lg whitespace-nowrap ml-3 shrink-0" style={{ color: tone }}>
+                {blockedCount > 0 ? '—' : `${isHandover ? '+' : '−'}${formatMoney(grandTotal)}`}
               </span>
             </div>
 
+            {blockedCount > 0 && (
+              <ErrorNote message={`${blockedCount} ta mahsulotda narx belgilanmagan — narx belgilang yoki ro'yxatdan olib tashlang`} />
+            )}
+
             {err && <ErrorNote message={err} />}
 
-            <button onClick={submit}
-                    disabled={mut.isPending || qty < 1 || unitPrice === null}
-                    className="w-full py-4 rounded-2xl font-bold text-white text-base active:scale-95 transition-all disabled:opacity-50"
-                    style={{ background: tone }}>
-              {mut.isPending ? '...' : `✅ ${title} (${qty} dona)`}
-            </button>
-
-            {unitPrice === null && (
-              <p className="text-xs text-center" style={{ color: RED }}>
-                Avval "Narxlar" bo'limidan narx belgilang
-              </p>
-            )}
+            <div className="flex gap-3">
+              <button onClick={onClose} disabled={mut.isPending}
+                      className="flex-1 py-4 rounded-2xl font-semibold text-sm disabled:opacity-50"
+                      style={{ background: 'var(--tg-theme-secondary-bg-color)', color: 'var(--tg-theme-hint-color)' }}>
+                Bekor
+              </button>
+              <button onClick={submit} disabled={!canSend}
+                      className="flex-[2] py-4 rounded-2xl font-bold text-white text-base active:scale-95 transition-all disabled:opacity-50"
+                      style={{ background: tone }}>
+                {mut.isPending ? 'Yuborilmoqda...' : `✅ Yuborish (${totalPieces} dona)`}
+              </button>
+            </div>
           </div>
         )}
       </div>
+
+      {/* Running count + Davom etish, parked above BottomNav */}
+      {showPickBar && (
+        <div className="fixed left-0 right-0 px-3" style={{ bottom: NAV_GAP, zIndex: 20 }}>
+          <div className="rounded-2xl p-3 shadow-2xl"
+               style={{ background: 'var(--tg-theme-secondary-bg-color)',
+                        border: '1px solid rgba(128,128,128,.14)' }}>
+            <p className="text-xs text-center mb-2" style={{ color: 'var(--tg-theme-hint-color)' }}>
+              {pickedIds.length === 0
+                ? 'Mahsulotlarni belgilang'
+                : `${pickedIds.length} ta mahsulot tanlandi`}
+            </p>
+            {limitHit && (
+              <p className="text-xs text-center mb-2" style={{ color: RED }}>
+                Bir martada ko'pi bilan {MAX_BATCH_ITEMS} ta mahsulot yuboriladi
+              </p>
+            )}
+            <button onClick={goToQty} disabled={pickedIds.length === 0}
+                    className="w-full py-3.5 rounded-2xl font-bold text-white text-base active:scale-95 transition-all disabled:opacity-40"
+                    style={{ background: tone }}>
+              Davom etish ›
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

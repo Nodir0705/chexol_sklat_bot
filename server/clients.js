@@ -13,10 +13,11 @@
 // All money is integer so'm — no floats anywhere in the money path.
 
 import { migrate } from './schema.js'
-import { formatReceipt } from './notify.js'
+import { formatReceipt, formatBatchReceipt } from './notify.js'
 
 const MAX_QTY   = 99999          // matches the Mini App's quantity input cap
 const MAX_MONEY = 10_000_000_000 // so'm; qty*unit_price stays well under 2^53
+const MAX_BATCH = 50             // products in one handover/return; spec §3
 const KINDS     = ['handover', 'return', 'payment', 'adjustment']
 
 // ─── Errors (user-facing text is Uzbek) ────────────────────────────────────────
@@ -35,6 +36,8 @@ const E = {
   balanceNotZero: "balans nolga teng emas, mijozni o'chirib bo'lmaydi",
   alreadyRev:     'bu yozuv allaqachon bekor qilingan',
   isReversal:     "bekor qilish yozuvini bekor qilib bo'lmaydi",
+  itemsRequired:  'kamida bitta mahsulot tanlang',
+  tooManyItems:   `bir vaqtda ko'pi bilan ${MAX_BATCH} ta mahsulot yuborish mumkin`,
 }
 
 export default async function clientRoutes(app, { db, requireAuth, requireRead, notify } = {}) {
@@ -49,15 +52,23 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
 
   // One shape for a ledger row, used by the list and by every mutation's echo,
   // so the client never has to reconcile two different row layouts.
+  //
+  // parent_name is the IMMEDIATE parent, carried so productLabel() in notify.js
+  // can qualify a bare leaf ("Qora" → "Cristal › Qora"). It comes from a join on
+  // an integer PK — 1:1, and null for a root or a payment row — NOT from
+  // splitting category_path: POST /api/categories only trims the name, so an
+  // owner-entered name may itself contain " › " and a split would cut it there.
   const LEDGER_SELECT = `
     SELECT l.id, l.client_id, l.kind, l.category_id,
            pc.name AS category_name,
+           pp.name AS parent_name,
            l.qty, l.unit_price, l.amount, l.note,
            l.performed_by, l.performed_by_name, l.reverses_id,
            (SELECT r.id FROM client_ledger r WHERE r.reverses_id = l.id) AS reversed_by,
            l.created_at
     FROM client_ledger l
     LEFT JOIN product_categories pc ON pc.id = l.category_id
+    LEFT JOIN product_categories pp ON pp.id = pc.parent_id
   `
 
   const q = {
@@ -215,14 +226,35 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
   // here re-reads it.
 
   /** Fire-and-forget. Swallows everything — a Telegram outage must not stop the
-   *  owner recording business, and the row is already committed by now. */
-  function post(client, entry, balance, orig = null) {
+   *  owner recording business, and the row is already committed by now. The
+   *  text is rendered INSIDE the try: a formatter fed owner-entered text is one
+   *  more thing that must not reach the reply. */
+  function postText(client, render) {
     if (typeof notify !== 'function') return
     if (!client || client.telegram_chat_id == null) return
     try {
-      Promise.resolve(notify(client.telegram_chat_id, formatReceipt(entry, balance, orig)))
-        .catch(() => {})
+      Promise.resolve(notify(client.telegram_chat_id, render())).catch(() => {})
     } catch {}
+  }
+
+  function post(client, entry, balance, orig = null) {
+    postText(client, () => formatReceipt(entry, balance, orig))
+  }
+
+  /**
+   * One message for one movement, however many rows it wrote. A lone row keeps
+   * the single-item template — spec §1: "A SINGLE item must render exactly as it
+   * does today ... Only two or more items use the list form" — which also covers
+   * a batch that merged down to one product.
+   *
+   * `opts` is formatBatchReceipt's { note, at }: the note shared by every row,
+   * passed explicitly because a batch's note belongs to the movement rather
+   * than to any one product. `at` is left to default to the first row's stamp —
+   * all the rows of a batch are written in one transaction.
+   */
+  function postMovement(client, entries, balance, note) {
+    if (entries.length === 1) return post(client, entries[0], balance)
+    postText(client, () => formatBatchReceipt(entries, balance, { note }))
   }
 
   /** Run fn inside a transaction; fn returns the value to hand back. */
@@ -472,46 +504,78 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
 
   // ─── Ledger (write) ─────────────────────────────────────────────────────────
 
+  // Per-item guards, split at the point where the single routes look the client
+  // up, so that route's check order (and therefore its status codes) is
+  // unchanged while the batch routes reuse the same two halves.
+
+  /** Shape of one { category_id, qty }. Returns the Uzbek reason, or null. */
+  function itemShapeError(item) {
+    const { category_id, qty } = item ?? {}
+    if (!Number.isInteger(category_id) || category_id < 1) return E.catNotFound
+    if (!isQty(qty)) return E.qty
+    return null
+  }
+
+  /** Catalogue position and price of one item: { unit_price } or { error }. */
+  function priceItem(clientId, categoryId) {
+    const target = stockTarget(categoryId)
+    if (!target.ok) return { error: target.error }
+    const unit_price = resolvePrice(clientId, categoryId)
+    if (unit_price == null) return { error: E.noPrice }
+    return { unit_price }
+  }
+
+  const heldError = held => ({ error: `mijozda bu mahsulotdan ${held} dona bor`, held })
+
+  /** The one place a movement's sign lives: a handover adds to the debt, a
+   *  return subtracts. Every handover/return row — single or batch — is built
+   *  here, so the two can never disagree about direction. */
+  function movementRow(kind, { category_id, qty, unit_price }, note = null) {
+    const total = qty * unit_price
+    return { kind, category_id, qty, unit_price, amount: kind === 'return' ? -total : total, note }
+  }
+
   /** Shared front half of handover/return: guards, price, held quantity. */
   function prepareMovement(req, reply, kind) {
     const id = idParam(req.params.id)
     if (!id) { reply.code(400).send({ error: E.badId }); return null }
 
     const { category_id, qty } = req.body ?? {}
-    if (!Number.isInteger(category_id) || category_id < 1)
-      { reply.code(400).send({ error: E.catNotFound }); return null }
-    if (!isQty(qty)) { reply.code(400).send({ error: E.qty }); return null }
+    const shape = itemShapeError({ category_id, qty })
+    if (shape) { reply.code(400).send({ error: shape }); return null }
 
     const client = q.getClient.get(id)
     if (!client) { reply.code(404).send({ error: E.clientNotFound }); return null }
 
-    const target = stockTarget(category_id)
-    if (!target.ok) { reply.code(400).send({ error: target.error }); return null }
-
-    const unitPrice = resolvePrice(id, category_id)
-    if (unitPrice == null) { reply.code(400).send({ error: E.noPrice }); return null }
+    const priced = priceItem(id, category_id)
+    if (priced.error) { reply.code(400).send({ error: priced.error }); return null }
 
     if (kind === 'return') {
       const { held } = q.heldQty.get(id, category_id)
-      if (qty > held) {
-        reply.code(409).send({ error: `mijozda bu mahsulotdan ${held} dona bor`, held })
-        return null
-      }
+      if (qty > held) { reply.code(409).send(heldError(held)); return null }
     }
-    return { client, id, category_id, qty, unitPrice, note: cleanNote(req.body?.note) }
+    return {
+      client,
+      item: { category_id, qty, unit_price: priced.unit_price },
+      note: cleanNote(req.body?.note),
+    }
+  }
+
+  /** Append one ledger row, return its id. The CALLER owns the transaction —
+   *  which is how a batch gets all-or-nothing out of the same insert. */
+  function insertRow(user, clientId, row) {
+    q.insLedger.run(
+      clientId, row.kind, row.category_id ?? null, row.qty ?? null,
+      row.unit_price ?? null, row.amount, row.note ?? null,
+      user?.id ?? null, user?.first_name ?? user?.username ?? null,
+      row.reverses_id ?? null,
+    )
+    return q.lastId.get().id
   }
 
   function insertAndReply(reply, user, client, row) {
     try {
-      const entryId = tx(() => {
-        q.insLedger.run(
-          client.id, row.kind, row.category_id ?? null, row.qty ?? null,
-          row.unit_price ?? null, row.amount, row.note ?? null,
-          user?.id ?? null, user?.first_name ?? user?.username ?? null,
-          row.reverses_id ?? null,
-        )
-        return q.lastId.get().id
-      })
+      const entryId = tx(() => insertRow(user, client.id, row))
       const entry   = withPath(q.entry.get(entryId))
       const balance = balanceOf(client.id)
       post(client, entry, balance)   // after COMMIT, never awaited
@@ -527,14 +591,7 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
     if (!user) return
     const m = prepareMovement(req, reply, 'handover')
     if (!m) return
-    return insertAndReply(reply, user, m.client, {
-      kind: 'handover',
-      category_id: m.category_id,
-      qty: m.qty,
-      unit_price: m.unitPrice,
-      amount: m.qty * m.unitPrice,
-      note: m.note,
-    })
+    return insertAndReply(reply, user, m.client, movementRow('handover', m.item, m.note))
   })
 
   // return → amount = -qty * unit_price, capped at what the client still holds
@@ -543,15 +600,104 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
     if (!user) return
     const m = prepareMovement(req, reply, 'return')
     if (!m) return
-    return insertAndReply(reply, user, m.client, {
-      kind: 'return',
-      category_id: m.category_id,
-      qty: m.qty,
-      unit_price: m.unitPrice,
-      amount: -(m.qty * m.unitPrice),
-      note: m.note,
-    })
+    return insertAndReply(reply, user, m.client, movementRow('return', m.item, m.note))
   })
+
+  // ─── Batch handover / return (spec §3) ──────────────────────────────────────
+  //
+  // Same ledger, same guards, same renderer. Only two things differ from sending
+  // the items one by one: every row commits or none does, and the whole movement
+  // is announced in ONE Telegram message. The ledger stays per-product — a batch
+  // is an atomicity and presentation concern, not a schema change.
+
+  /** Which item, and why. `index` is 0-based, matching the payload. */
+  const itemError = (index, reason, extra = {}) =>
+    ({ error: `${index + 1}-mahsulot: ${reason}`, index, ...extra })
+
+  /**
+   * Validate the payload and fold it into the rows to insert.
+   *
+   * Merging happens BEFORE the qty cap and before the held check, so two rows
+   * for the same product can neither slip past MAX_QTY nor each pass the
+   * return-exceeds-held test on its own while busting it together.
+   *
+   * Returns { code, body } for the first bad item, or { rows }.
+   */
+  function prepareBatch(clientId, kind, items, note) {
+    if (!Array.isArray(items) || items.length === 0)
+      return { code: 400, body: { error: E.itemsRequired } }
+    // The cap is on what was SENT: counting after the merge would let 51 rows of
+    // one product through as a single row.
+    if (items.length > MAX_BATCH)
+      return { code: 400, body: { error: E.tooManyItems, count: items.length } }
+
+    const merged = new Map()   // category_id → row, in first-seen order
+    for (const [i, raw] of items.entries()) {
+      const item  = raw ?? {}
+      const shape = itemShapeError(item)
+      if (shape) return { code: 400, body: itemError(i, shape, { category_id: item.category_id ?? null }) }
+
+      const seen = merged.get(item.category_id)
+      if (seen) {
+        // The same product twice: one row carrying the summed quantity, which
+        // still has to fit a ledger row's qty.
+        const qty = seen.qty + item.qty
+        if (!isQty(qty)) return { code: 400, body: itemError(i, E.qty, { category_id: item.category_id }) }
+        seen.qty = qty
+        continue
+      }
+
+      const priced = priceItem(clientId, item.category_id)
+      if (priced.error) return { code: 400, body: itemError(i, priced.error, { category_id: item.category_id }) }
+      merged.set(item.category_id, {
+        index: i, category_id: item.category_id, qty: item.qty, unit_price: priced.unit_price,
+      })
+    }
+
+    if (kind === 'return') {
+      for (const row of merged.values()) {
+        const { held } = q.heldQty.get(clientId, row.category_id)
+        if (row.qty > held)
+          return {
+            code: 409,
+            body: itemError(row.index, heldError(held).error, { category_id: row.category_id, held }),
+          }
+      }
+    }
+
+    return { rows: [...merged.values()].map(r => movementRow(kind, r, note)) }
+  }
+
+  function handleBatch(req, reply, kind) {
+    const user = requireAuth(req, reply)
+    if (!user) return
+    const id = idParam(req.params.id)
+    if (!id) return reply.code(400).send({ error: E.badId })
+    const client = q.getClient.get(id)
+    if (!client) return reply.code(404).send({ error: E.clientNotFound })
+
+    const note     = cleanNote(req.body?.note)
+    const prepared = prepareBatch(id, kind, req.body?.items, note)
+    if (prepared.body) return reply.code(prepared.code).send(prepared.body)
+
+    try {
+      // One transaction around every insert — a throw anywhere inside rolls the
+      // whole movement back, so a batch can never land half-written.
+      const ids = tx(() => prepared.rows.map(row => insertRow(user, client.id, row)))
+
+      const byId    = catIndex()   // built once, not once per row
+      const entries = ids.map(entryId => withPath(q.entry.get(entryId), byId))
+      const balance = balanceOf(client.id)
+      const total   = entries.reduce((sum, e) => sum + e.amount, 0)
+      postMovement(client, entries, balance, note)   // after COMMIT, never awaited
+      return reply.send({ entries, balance, total })
+    } catch (err) {
+      return reply.code(500).send({ error: String(err) })
+    }
+  }
+
+  app.post('/api/clients/:id/handover/batch', (req, reply) => handleBatch(req, reply, 'handover'))
+  app.post('/api/clients/:id/return/batch',   (req, reply) => handleBatch(req, reply, 'return'))
 
   // payment → amount = -amount
   app.post('/api/clients/:id/payment', (req, reply) => {
@@ -615,4 +761,4 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
   })
 }
 
-export { MAX_QTY, MAX_MONEY, KINDS }
+export { MAX_QTY, MAX_MONEY, MAX_BATCH, KINDS }
