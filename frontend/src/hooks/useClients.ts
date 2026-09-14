@@ -3,9 +3,9 @@ import {
   fetchClients, fetchClient, createClient, updateClient, deleteClient,
   fetchLedger, postHandover, postReturn, postPayment, reverseEntry,
   fetchClientPrices, setClientPrice, removeClientPrice,
-  fetchStatement, sendStatement,
+  fetchStatement, sendStatement, linkGroup, unlinkGroup,
 } from '../api/clients'
-import type { Client, ClientPrice, ClientRef, LedgerEntry, LedgerResult, Statement } from '../api/clients'
+import type { Client, ClientPrice, ClientRef, LedgerEntry, LedgerResult, LinkResult, Statement } from '../api/clients'
 
 // ─── Query keys ───────────────────────────────────────────────────────────────
 
@@ -163,5 +163,27 @@ export function useRemoveClientPrice(clientId: number) {
 export function useSendStatement(clientId: number) {
   return useMutation<{ sent: boolean }, Error, { year: number; month: number }>({
     mutationFn: ({ year, month }) => sendStatement(clientId, year, month),
+  })
+}
+
+export function useLinkGroup(clientId: number) {
+  const qc = useQueryClient()
+  return useMutation<LinkResult, Error, { code: string }>({
+    mutationFn: ({ code }) => linkGroup(clientId, code),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['client', clientId] })
+      qc.invalidateQueries({ queryKey: ['clients'] })
+    },
+  })
+}
+
+export function useUnlinkGroup(clientId: number) {
+  const qc = useQueryClient()
+  return useMutation<LinkResult, Error, void>({
+    mutationFn: () => unlinkGroup(clientId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['client', clientId] })
+      qc.invalidateQueries({ queryKey: ['clients'] })
+    },
   })
 }

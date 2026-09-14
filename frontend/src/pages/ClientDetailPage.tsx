@@ -5,6 +5,8 @@ import {
   useClient, useLedger, useClientPrices, useStatement,
   useHandover, useReturnGoods, usePayment, useReverseEntry,
   useSetClientPrice, useRemoveClientPrice, useSendStatement,
+  useLinkGroup,
+  useUnlinkGroup,
 } from '../hooks/useClients'
 import { formatMoney, formatSignedMoney, groupDigits } from '../api/clients'
 import type { ClientPrice, LedgerEntry, LedgerKind, Statement } from '../api/clients'
@@ -1067,6 +1069,82 @@ export interface ClientDetailPageProps {
   onBack: () => void
 }
 
+
+// ─── Group link ───────────────────────────────────────────────────────────────
+// The bot mints a code with /ulash in the client's group; this is where it is
+// redeemed. Without this the receipts feature is unreachable -- the app could
+// only ever tell you a group was missing.
+
+function GroupLinkCard({ clientId, chatId }: { clientId: number; chatId: number | null }) {
+  const [code, setCode] = useState('')
+  const [msg, setMsg] = useState<string | null>(null)
+  const link = useLinkGroup(clientId)
+  const unlink = useUnlinkGroup(clientId)
+
+  const submit = () => {
+    const c = code.trim()
+    if (!c) return
+    haptic('medium')
+    setMsg(null)
+    link.mutate({ code: c }, {
+      onSuccess: (r) => {
+        haptic('success')
+        setCode('')
+        setMsg(`✅ Guruh ulandi${r.title ? `: ${r.title}` : ''}`)
+      },
+      onError: (e) => { haptic('error'); setMsg(`❌ ${errText(e)}`) },
+    })
+  }
+
+  if (chatId !== null) {
+    return (
+      <div className="mx-3 mb-3 p-3 rounded-2xl"
+           style={{ background: 'var(--tg-theme-secondary-bg-color)' }}>
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-xs" style={{ color: 'var(--tg-theme-hint-color)' }}>
+            Guruh ulangan — har bir amal avtomatik yuboriladi
+          </p>
+          <button onClick={() => { haptic('medium'); unlink.mutate() }}
+                  disabled={unlink.isPending}
+                  className="text-xs px-2 py-1 rounded-lg shrink-0 disabled:opacity-40"
+                  style={{ background: 'rgba(239,68,68,.12)', color: '#ef4444' }}>
+            {unlink.isPending ? '...' : 'Uzish'}
+          </button>
+        </div>
+        {unlink.isError && (
+          <p className="text-xs mt-2" style={{ color: '#ef4444' }}>{errText(unlink.error)}</p>
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <div className="mx-3 mb-3 p-3 rounded-2xl space-y-2"
+         style={{ background: 'var(--tg-theme-secondary-bg-color)' }}>
+      <p className="text-xs" style={{ color: 'var(--tg-theme-hint-color)' }}>
+        Mijoz guruhida <b>/ulash</b> yuboring, so'ng koddni shu yerga kiriting:
+      </p>
+      <div className="flex gap-2">
+        <input value={code}
+               onChange={e => setCode(e.target.value.toUpperCase().slice(0, 8))}
+               onKeyDown={e => { if (e.key === 'Enter') submit() }}
+               placeholder="ABC123"
+               autoCapitalize="characters"
+               autoCorrect="off"
+               spellCheck={false}
+               className="flex-1 min-w-0 px-3 py-2.5 rounded-xl text-sm tracking-widest text-center outline-none"
+               style={{ background: 'var(--tg-theme-bg-color)', color: 'var(--tg-theme-text-color)' }} />
+        <button onClick={submit} disabled={link.isPending || code.trim().length < 4}
+                className="px-4 py-2.5 rounded-xl text-sm font-bold shrink-0 active:scale-95 transition-all disabled:opacity-40"
+                style={{ background: ACCENT, color: 'var(--tg-theme-button-text-color)' }}>
+          {link.isPending ? '...' : 'Ulash'}
+        </button>
+      </div>
+      {msg && <p className="text-xs break-words" style={{ color: 'var(--tg-theme-hint-color)' }}>{msg}</p>}
+    </div>
+  )
+}
+
 export default function ClientDetailPage({ clientId, onBack }: ClientDetailPageProps) {
   const client = useClient(clientId)
   const [tab, setTab] = useState<Tab>('ledger')
@@ -1104,6 +1182,10 @@ export default function ClientDetailPage({ clientId, onBack }: ClientDetailPageP
           </span>
         )}
       </div>
+
+      {client.data && (
+        <GroupLinkCard clientId={clientId} chatId={client.data.telegram_chat_id} />
+      )}
 
       {/* Balance */}
       {client.isLoading && (

@@ -181,6 +181,21 @@ export function reverseEntry(entryId: number, note?: string): Promise<LedgerResu
   return req<LedgerResult>(`/ledger/${entryId}/reverse`, 'POST', note ? { note } : {})
 }
 
+export interface LinkResult {
+  linked: boolean
+  telegram_chat_id?: number | null
+  title?: string | null
+}
+
+/** Redeem a /ulash code, binding that Telegram group to this client. */
+export function linkGroup(id: number, code: string): Promise<LinkResult> {
+  return req<LinkResult>(`/clients/${id}/link`, 'POST', { code })
+}
+
+export function unlinkGroup(id: number): Promise<LinkResult> {
+  return req<LinkResult>(`/clients/${id}/link`, 'DELETE')
+}
+
 // ─── Prices ───────────────────────────────────────────────────────────────────
 
 export function fetchClientPrices(id: number): Promise<ClientPrice[]> {

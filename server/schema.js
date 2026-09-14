@@ -78,4 +78,18 @@ export function migrate(db) {
   // SQLite has no ADD COLUMN IF NOT EXISTS; a second run throws "duplicate
   // column name" and that is the success case on an already-migrated file.
   try { db.exec('ALTER TABLE product_categories ADD COLUMN default_price INTEGER') } catch {}
+
+  // /ulash handshake codes. The bot (Python) creates this table lazily on first
+  // use; declaring it here too means a redeem from the server side works even if
+  // nobody has run /ulash yet. DDL is kept identical to handlers/groups.py.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS group_link_codes (
+      code       TEXT PRIMARY KEY,
+      chat_id    INTEGER NOT NULL,
+      title      TEXT,
+      expires_at DATETIME NOT NULL,
+      used_at    DATETIME NULL
+    )
+  `)
+  db.exec('CREATE INDEX IF NOT EXISTS ix_group_link_codes_chat_id ON group_link_codes (chat_id)')
 }
