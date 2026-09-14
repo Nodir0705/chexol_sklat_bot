@@ -31,4 +31,4 @@ export interface DeleteImpact {
 }
 
 export type Direction = 'in' | 'out'
-export type Page = 'action' | 'history' | 'products'
+export type Page = 'action' | 'history' | 'products' | 'clients'

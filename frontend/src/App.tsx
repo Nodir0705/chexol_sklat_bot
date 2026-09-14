@@ -6,6 +6,7 @@ import type { Page } from './types'
 const ActionPage   = lazy(() => import('./pages/ActionPage'))
 const HistoryPage  = lazy(() => import('./pages/HistoryPage'))
 const ProductsPage = lazy(() => import('./pages/ProductsPage'))
+const ClientsPage  = lazy(() => import('./pages/ClientsPage'))
 
 function PageSkeleton() {
   return (
@@ -55,6 +56,7 @@ export default function App() {
         {page === 'action'   && <ActionPage />}
         {page === 'history'  && <HistoryPage />}
         {page === 'products' && <ProductsPage />}
+        {page === 'clients'  && <ClientsPage />}
       </Suspense>
       <BottomNav page={page} setPage={setPage} />
     </div>

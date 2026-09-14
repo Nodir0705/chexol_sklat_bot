@@ -1,4 +1,5 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, BigInteger
+from sqlalchemy import (Column, Integer, String, ForeignKey, DateTime, BigInteger,
+                        Index, UniqueConstraint)
 from sqlalchemy.orm import declarative_base, relationship, backref
 from sqlalchemy.sql import func
 
@@ -27,6 +28,8 @@ class ProductCategory(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
     parent_id = Column(Integer, ForeignKey('product_categories.id'), nullable=True)
+    # Fallback unit price in so'm when a client has no client_prices override.
+    default_price = Column(Integer, nullable=True)
     deleted_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -65,3 +68,74 @@ class StockTransaction(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     category = relationship("ProductCategory", back_populates="transactions")
+
+
+# ─── Client ledger / Mijozlar models ──────────────────────────────────────────
+
+class Client(Base):
+    """A person the owner hands goods to on consignment."""
+    __tablename__ = 'clients'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
+    phone = Column(String, nullable=True)
+    # Bound by /ulash run in the client's Telegram group; negative for groups.
+    telegram_chat_id = Column(BigInteger, unique=True, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+    prices = relationship("ClientPrice", back_populates="client")
+    ledger = relationship("ClientLedger", back_populates="client")
+
+
+class ClientPrice(Base):
+    """Per-client unit price override for one product category.
+
+    Price resolution: client_prices -> product_categories.default_price -> error.
+    """
+    __tablename__ = 'client_prices'
+    __table_args__ = (
+        UniqueConstraint('client_id', 'category_id', name='uq_client_prices_client_category'),
+        Index('ix_client_prices_client_id', 'client_id'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    client_id = Column(Integer, ForeignKey('clients.id'), nullable=False)
+    category_id = Column(Integer, ForeignKey('product_categories.id'), nullable=False)
+    unit_price = Column(Integer, nullable=False)  # so'm, > 0
+
+    client = relationship("Client", back_populates="prices")
+    category = relationship("ProductCategory")
+
+
+class ClientLedger(Base):
+    """Append-only ledger of everything that moves a client's balance.
+
+    `amount` is signed so'm and is the only field the balance reads:
+        SELECT COALESCE(SUM(amount), 0) FROM client_ledger WHERE client_id = ?
+    handover -> +qty*unit_price, return -> -qty*unit_price, payment -> -amount,
+    adjustment -> either sign. Corrections never update or delete: a mistake is
+    cancelled by inserting a reversing row whose reverses_id points at the original.
+    """
+    __tablename__ = 'client_ledger'
+    __table_args__ = (
+        Index('ix_client_ledger_client_id_created_at', 'client_id', 'created_at'),
+        Index('ix_client_ledger_reverses_id', 'reverses_id'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    client_id = Column(Integer, ForeignKey('clients.id'), nullable=False)
+    # 'handover' | 'return' | 'payment' | 'adjustment'
+    kind = Column(String, nullable=False)
+    category_id = Column(Integer, ForeignKey('product_categories.id'), nullable=True)
+    qty = Column(Integer, nullable=True)          # set for handover/return; > 0
+    unit_price = Column(Integer, nullable=True)   # price snapshot at the time of the event
+    amount = Column(Integer, nullable=False)      # signed so'm
+    note = Column(String, nullable=True)
+    performed_by = Column(BigInteger, nullable=True)      # Telegram id
+    performed_by_name = Column(String, nullable=True)
+    reverses_id = Column(Integer, ForeignKey('client_ledger.id'), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    client = relationship("Client", back_populates="ledger")
+    category = relationship("ProductCategory")

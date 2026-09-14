@@ -1,11 +1,13 @@
 import logging
 
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, Application
+from telegram.ext import (ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+                          ChatMemberHandler, Application)
 
 from config import BOT_TOKEN
 from database.db import init_db
 from handlers.start import start
 from handlers.admin import handle_approve, handle_reject
+from handlers.groups import ulash, on_my_chat_member
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -25,6 +27,8 @@ def main():
     application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("ulash", ulash))
+    application.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_handler(CallbackQueryHandler(handle_approve, pattern=r"^approve_\d+$"))
     application.add_handler(CallbackQueryHandler(handle_reject,  pattern=r"^reject_\d+$"))
 
