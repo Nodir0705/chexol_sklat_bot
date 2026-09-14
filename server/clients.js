@@ -1,0 +1,591 @@
+// Client ledger (Mijozlar) — clients, per-client prices, and the append-only
+// ledger that the running balance is derived from.
+//
+// Registered from index.js as:
+//   await app.register(clientRoutes, { db, requireAuth, requireRead, notify })
+//
+// Two rules this module never bends:
+//   1. Balance is ALWAYS SUM(amount) over client_ledger. There is exactly one
+//      way to compute it, so a cached/derived total can never drift.
+//   2. Corrections never UPDATE or DELETE a ledger row. A mistake is cancelled
+//      by inserting an opposite row whose reverses_id points at the original.
+//
+// All money is integer so'm — no floats anywhere in the money path.
+
+import { migrate } from './schema.js'
+
+const MAX_QTY   = 99999          // matches the Mini App's quantity input cap
+const MAX_MONEY = 10_000_000_000 // so'm; qty*unit_price stays well under 2^53
+const KINDS     = ['handover', 'return', 'payment', 'adjustment']
+
+// ─── Errors (user-facing text is Uzbek) ────────────────────────────────────────
+
+const E = {
+  clientNotFound: 'mijoz topilmadi',
+  entryNotFound:  'yozuv topilmadi',
+  badId:          "noto'g'ri id",
+  nameRequired:   'ism talab qilinadi',
+  noPrice:        'narx belgilanmagan',
+  catNotFound:    "kategoriya topilmadi yoki o'chirilgan",
+  catNotProduct:  'kategoriya mahsulot emas',
+  qty:            `miqdor 1 dan ${MAX_QTY} gacha butun son bo'lishi kerak`,
+  amount:         `summa 1 dan ${MAX_MONEY} gacha butun son bo'lishi kerak`,
+  unitPrice:      `narx 1 dan ${MAX_MONEY} gacha butun son bo'lishi kerak`,
+  balanceNotZero: "balans nolga teng emas, mijozni o'chirib bo'lmaydi",
+  alreadyRev:     'bu yozuv allaqachon bekor qilingan',
+  isReversal:     "bekor qilish yozuvini bekor qilib bo'lmaydi",
+}
+
+export default async function clientRoutes(app, { db, requireAuth, requireRead, notify } = {}) {
+  // ─── Schema ─────────────────────────────────────────────────────────────────
+  // Owned by server/schema.js, which index.js runs before registering this
+  // plugin. This file used to declare its own copy; the two disagreed on index
+  // names (idx_* vs ix_*), so running both produced six indexes over the same
+  // three column sets — duplicated write cost on every insert, forever.
+  migrate(db)
+
+  // ─── Prepared statements ────────────────────────────────────────────────────
+
+  // One shape for a ledger row, used by the list and by every mutation's echo,
+  // so the client never has to reconcile two different row layouts.
+  const LEDGER_SELECT = `
+    SELECT l.id, l.client_id, l.kind, l.category_id,
+           pc.name AS category_name,
+           l.qty, l.unit_price, l.amount, l.note,
+           l.performed_by, l.performed_by_name, l.reverses_id,
+           (SELECT r.id FROM client_ledger r WHERE r.reverses_id = l.id) AS reversed_by,
+           l.created_at
+    FROM client_ledger l
+    LEFT JOIN product_categories pc ON pc.id = l.category_id
+  `
+
+  const q = {
+    listClients: db.prepare(`
+      SELECT c.id, c.name, c.phone, c.telegram_chat_id,
+             (SELECT COALESCE(SUM(amount), 0) FROM client_ledger WHERE client_id = c.id) AS balance
+      FROM clients c
+      WHERE c.deleted_at IS NULL
+      ORDER BY c.name
+    `),
+    getClient: db.prepare(
+      'SELECT id, name, phone, telegram_chat_id FROM clients WHERE id = ? AND deleted_at IS NULL'
+    ),
+    insClient:  db.prepare('INSERT INTO clients (name, phone) VALUES (?, ?)'),
+    updClient:  db.prepare('UPDATE clients SET name = ?, phone = ? WHERE id = ? AND deleted_at IS NULL'),
+    delClient:  db.prepare('UPDATE clients SET deleted_at = CURRENT_TIMESTAMP WHERE id = ? AND deleted_at IS NULL'),
+
+    // The one and only balance query.
+    balance:    db.prepare('SELECT COALESCE(SUM(amount), 0) AS balance FROM client_ledger WHERE client_id = ?'),
+
+    ledger:     db.prepare(`${LEDGER_SELECT} WHERE l.client_id = ? ORDER BY l.created_at DESC, l.id DESC LIMIT ?`),
+    entry:      db.prepare(`${LEDGER_SELECT} WHERE l.id = ?`),
+    rawEntry:   db.prepare('SELECT * FROM client_ledger WHERE id = ?'),
+    reversalOf: db.prepare('SELECT id FROM client_ledger WHERE reverses_id = ? LIMIT 1'),
+    insLedger:  db.prepare(`
+      INSERT INTO client_ledger
+        (client_id, kind, category_id, qty, unit_price, amount, note,
+         performed_by, performed_by_name, reverses_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `),
+    // Net quantity of one product a client currently holds. Reversals flip the
+    // sign of amount while keeping kind and qty, so the direction must be read
+    // from amount — keying off kind alone would make a reversed handover *add*
+    // to what the client holds.
+    heldQty: db.prepare(`
+      SELECT COALESCE(SUM(CASE WHEN amount > 0 THEN qty ELSE -qty END), 0) AS held
+      FROM client_ledger
+      WHERE client_id = ? AND category_id = ? AND qty IS NOT NULL
+        AND kind IN ('handover', 'return')
+    `),
+
+    priceOverride: db.prepare('SELECT unit_price FROM client_prices WHERE client_id = ? AND category_id = ?'),
+    upsertPrice:   db.prepare(`
+      INSERT INTO client_prices (client_id, category_id, unit_price) VALUES (?, ?, ?)
+      ON CONFLICT(client_id, category_id) DO UPDATE SET unit_price = excluded.unit_price
+    `),
+    delPrice:  db.prepare('DELETE FROM client_prices WHERE client_id = ? AND category_id = ?'),
+    priceList: db.prepare(`
+      SELECT pc.id AS category_id, pc.name, pc.default_price, cp.unit_price AS override
+      FROM product_categories pc
+      LEFT JOIN client_prices cp ON cp.category_id = pc.id AND cp.client_id = ?
+      WHERE pc.deleted_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM product_categories ch WHERE ch.parent_id = pc.id AND ch.deleted_at IS NULL
+        )
+      ORDER BY pc.name
+    `),
+    defaultPrice:  db.prepare('SELECT default_price FROM product_categories WHERE id = ? AND deleted_at IS NULL'),
+    setDefault:    db.prepare('UPDATE product_categories SET default_price = ? WHERE id = ? AND deleted_at IS NULL'),
+
+    // Includes soft-deleted rows on purpose: ledger history for a removed
+    // product must still resolve its name and location.
+    allCats: db.prepare('SELECT id, parent_id, name FROM product_categories'),
+    catAlive: db.prepare('SELECT id FROM product_categories WHERE id = ? AND deleted_at IS NULL'),
+    catChild: db.prepare('SELECT 1 FROM product_categories WHERE parent_id = ? AND deleted_at IS NULL LIMIT 1'),
+    lastId:   db.prepare('SELECT last_insert_rowid() AS id'),
+  }
+
+  // ─── Validation ─────────────────────────────────────────────────────────────
+  //
+  // The stock routes once checked qty for truthiness only, which let -500, 0.5,
+  // 1e15 and "10" through into the arithmetic. Every numeric below goes through
+  // Number.isInteger with an explicit range, and body fields are never coerced,
+  // so the string "10" is rejected rather than quietly accepted.
+
+  const isQty   = v => Number.isInteger(v) && v >= 1 && v <= MAX_QTY
+  const isMoney = v => Number.isInteger(v) && v >= 1 && v <= MAX_MONEY
+
+  /** Route params arrive as strings; accept only a positive integer. */
+  function idParam(raw) {
+    const n = Number(raw)
+    return Number.isInteger(n) && n > 0 ? n : null
+  }
+
+  /** A category that may hold stock: active, and with no children of its own. */
+  function stockTarget(categoryId) {
+    if (!Number.isInteger(categoryId) || categoryId < 1) return { ok: false, error: E.catNotFound }
+    if (!q.catAlive.get(categoryId)) return { ok: false, error: E.catNotFound }
+    if (q.catChild.get(categoryId))  return { ok: false, error: E.catNotProduct }
+    return { ok: true }
+  }
+
+  /** Resolve the trimmed, non-empty name or null. */
+  function cleanName(v) {
+    return typeof v === 'string' && v.trim() ? v.trim() : null
+  }
+
+  function cleanPhone(v) {
+    if (v === undefined || v === null || v === '') return null
+    return typeof v === 'string' && v.trim() ? v.trim() : undefined // undefined = invalid
+  }
+
+  function cleanNote(v) {
+    if (v === undefined || v === null || v === '') return null
+    return typeof v === 'string' ? v.trim().slice(0, 500) || null : null
+  }
+
+  // ─── Helpers ────────────────────────────────────────────────────────────────
+
+  function balanceOf(clientId) {
+    return q.balance.get(clientId).balance
+  }
+
+  /** client_prices override → product_categories.default_price → null. */
+  function resolvePrice(clientId, categoryId) {
+    const override = q.priceOverride.get(clientId, categoryId)
+    if (override && override.unit_price != null) return override.unit_price
+    const cat = q.defaultPrice.get(categoryId)
+    if (cat && cat.default_price != null) return cat.default_price
+    return null
+  }
+
+  /** Parent chain of a category ("Nakitka › Ali cantara safir"), as /api/history does. */
+  function fullPath(catId, byId) {
+    const parts = []
+    let cur = byId.get(catId)
+    cur = cur && cur.parent_id != null ? byId.get(cur.parent_id) : null
+    while (cur) {
+      parts.unshift(cur.name)
+      cur = cur.parent_id != null ? byId.get(cur.parent_id) : null
+    }
+    return parts.join(' › ')
+  }
+
+  function catIndex() {
+    return new Map(q.allCats.all().map(c => [c.id, c]))
+  }
+
+  function withPath(row, byId = catIndex()) {
+    if (!row) return null
+    return { ...row, category_path: row.category_id != null ? fullPath(row.category_id, byId) : '' }
+  }
+
+  // ─── Telegram receipt ───────────────────────────────────────────────────────
+  // Posting never blocks the ledger write: the row is committed first, the post
+  // is fired afterwards and its failure can only reach the log, never the reply.
+
+  function money(n) {
+    const neg = n < 0
+    const s = String(Math.abs(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ' ')
+    return neg ? `-${s}` : s
+  }
+
+  function tashkentStr(utc) {
+    const d = new Date(String(utc ?? '').replace(' ', 'T') + 'Z')
+    const ms = Number.isNaN(d.getTime()) ? Date.now() : d.getTime()
+    const t = new Date(ms + 5 * 60 * 60 * 1000)
+    const p = n => String(n).padStart(2, '0')
+    return `${p(t.getUTCDate())}.${p(t.getUTCMonth() + 1)}.${t.getUTCFullYear()} ${p(t.getUTCHours())}:${p(t.getUTCMinutes())}`
+  }
+
+  function receipt(headline, entry, balance) {
+    return [
+      headline,
+      `📅 ${tashkentStr(entry.created_at)}`,
+      `💰 Umumiy qarz: ${money(balance)} so'm`,
+    ].join('\n')
+  }
+
+  // Receipts are sent with parse_mode: 'HTML', so anything interpolated from the
+  // database must be escaped. A category named "Qora & Oq" would otherwise make
+  // Telegram reject the whole message, and the client would silently never see
+  // a receipt while the ledger looked perfectly healthy.
+  const esc = (v) => String(v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+
+  function lineFor(entry) {
+    const name = esc(entry.category_name ?? '?')
+    return `${name} — ${entry.qty} dona × ${money(entry.unit_price)} = ${money(Math.abs(entry.amount))} so'm`
+  }
+
+  function headlineFor(entry) {
+    if (entry.reverses_id != null) return `❌ Bekor qilindi: ${
+      entry.kind === 'payment' ? `${money(Math.abs(entry.amount))} so'm` : lineFor(entry)
+    }`
+    if (entry.kind === 'handover') return `📦 Berildi: ${lineFor(entry)}`
+    if (entry.kind === 'return')   return `↩️ Qaytarildi: ${lineFor(entry)}`
+    if (entry.kind === 'payment')  return `💵 To'lov: ${money(Math.abs(entry.amount))} so'm`
+    return `✏️ Tuzatish: ${money(entry.amount)} so'm`
+  }
+
+  /** Fire-and-forget. Swallows everything — a Telegram outage must not stop the
+   *  owner recording business, and the row is already committed by now. */
+  function post(client, entry, balance) {
+    if (typeof notify !== 'function') return
+    if (!client || client.telegram_chat_id == null) return
+    try {
+      Promise.resolve(notify(client.telegram_chat_id, receipt(headlineFor(entry), entry, balance)))
+        .catch(() => {})
+    } catch {}
+  }
+
+  /** Run fn inside a transaction; fn returns the value to hand back. */
+  function tx(fn) {
+    db.exec('BEGIN')
+    try {
+      const out = fn()
+      db.exec('COMMIT')
+      return out
+    } catch (err) { db.exec('ROLLBACK'); throw err }
+  }
+
+  // ─── Clients ────────────────────────────────────────────────────────────────
+
+  app.get('/api/clients', (req, reply) => {
+    if (!requireRead(req, reply)) return
+    return reply.send(q.listClients.all())
+  })
+
+  app.post('/api/clients', (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const { name, phone } = req.body ?? {}
+    const clean = cleanName(name)
+    if (!clean) return reply.code(400).send({ error: E.nameRequired })
+    const tel = cleanPhone(phone)
+    if (tel === undefined) return reply.code(400).send({ error: "telefon noto'g'ri" })
+
+    try {
+      const id = tx(() => {
+        q.insClient.run(clean, tel)
+        return q.lastId.get().id
+      })
+      return reply.code(201).send({ id, name: clean, phone: tel })
+    } catch (err) {
+      return reply.code(500).send({ error: String(err) })
+    }
+  })
+
+  app.get('/api/clients/:id', (req, reply) => {
+    if (!requireRead(req, reply)) return
+    const id = idParam(req.params.id)
+    if (!id) return reply.code(400).send({ error: E.badId })
+    const client = q.getClient.get(id)
+    if (!client) return reply.code(404).send({ error: E.clientNotFound })
+    return reply.send({ ...client, balance: balanceOf(id) })
+  })
+
+  app.patch('/api/clients/:id', (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const id = idParam(req.params.id)
+    if (!id) return reply.code(400).send({ error: E.badId })
+    const client = q.getClient.get(id)
+    if (!client) return reply.code(404).send({ error: E.clientNotFound })
+
+    const { name, phone } = req.body ?? {}
+    let nextName = client.name
+    if (name !== undefined) {
+      const clean = cleanName(name)
+      if (!clean) return reply.code(400).send({ error: E.nameRequired })
+      nextName = clean
+    }
+    let nextPhone = client.phone
+    if (phone !== undefined) {
+      const tel = cleanPhone(phone)
+      if (tel === undefined) return reply.code(400).send({ error: "telefon noto'g'ri" })
+      nextPhone = tel
+    }
+
+    try {
+      tx(() => q.updClient.run(nextName, nextPhone, id))
+      return reply.send({ id, name: nextName, phone: nextPhone })
+    } catch (err) {
+      return reply.code(500).send({ error: String(err) })
+    }
+  })
+
+  // Soft delete, and only while the client owes nothing — a client with a
+  // non-zero balance still has money in play, and hiding them would hide it.
+  app.delete('/api/clients/:id', (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const id = idParam(req.params.id)
+    if (!id) return reply.code(400).send({ error: E.badId })
+
+    try {
+      const out = tx(() => {
+        const client = q.getClient.get(id)
+        if (!client) return { code: 404, body: { error: E.clientNotFound } }
+        const balance = balanceOf(id)
+        if (balance !== 0) return { code: 409, body: { error: E.balanceNotZero, balance } }
+        q.delClient.run(id)
+        return { code: 200, body: { deleted: true } }
+      })
+      return reply.code(out.code).send(out.body)
+    } catch (err) {
+      return reply.code(500).send({ error: String(err) })
+    }
+  })
+
+  // ─── Ledger (read) ──────────────────────────────────────────────────────────
+
+  app.get('/api/clients/:id/ledger', (req, reply) => {
+    if (!requireRead(req, reply)) return
+    const id = idParam(req.params.id)
+    if (!id) return reply.code(400).send({ error: E.badId })
+    if (!q.getClient.get(id)) return reply.code(404).send({ error: E.clientNotFound })
+
+    const asked = Number(req.query?.limit ?? 100)
+    const limit = Number.isFinite(asked) && asked > 0 ? Math.min(Math.floor(asked), 500) : 100
+    const byId = catIndex()
+    return reply.send(q.ledger.all(id, limit).map(r => withPath(r, byId)))
+  })
+
+  // ─── Prices ─────────────────────────────────────────────────────────────────
+
+  app.get('/api/clients/:id/prices', (req, reply) => {
+    if (!requireRead(req, reply)) return
+    const id = idParam(req.params.id)
+    if (!id) return reply.code(400).send({ error: E.badId })
+    if (!q.getClient.get(id)) return reply.code(404).send({ error: E.clientNotFound })
+
+    const byId = catIndex()
+    return reply.send(q.priceList.all(id).map(r => ({
+      category_id:   r.category_id,
+      name:          r.name,
+      path:          fullPath(r.category_id, byId),
+      unit_price:    r.override != null ? r.override : (r.default_price ?? null),
+      default_price: r.default_price ?? null,
+      is_override:   r.override != null,
+    })))
+  })
+
+  app.put('/api/clients/:id/prices/:catId', (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const id = idParam(req.params.id)
+    const catId = idParam(req.params.catId)
+    if (!id || !catId) return reply.code(400).send({ error: E.badId })
+    if (!q.getClient.get(id)) return reply.code(404).send({ error: E.clientNotFound })
+
+    const { unit_price } = req.body ?? {}
+    if (!isMoney(unit_price)) return reply.code(400).send({ error: E.unitPrice })
+    const target = stockTarget(catId)
+    if (!target.ok) return reply.code(400).send({ error: target.error })
+
+    try {
+      tx(() => q.upsertPrice.run(id, catId, unit_price))
+      return reply.send({ category_id: catId, unit_price })
+    } catch (err) {
+      return reply.code(500).send({ error: String(err) })
+    }
+  })
+
+  app.delete('/api/clients/:id/prices/:catId', (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const id = idParam(req.params.id)
+    const catId = idParam(req.params.catId)
+    if (!id || !catId) return reply.code(400).send({ error: E.badId })
+    if (!q.getClient.get(id)) return reply.code(404).send({ error: E.clientNotFound })
+
+    try {
+      tx(() => q.delPrice.run(id, catId))
+      return reply.send({ removed: true })
+    } catch (err) {
+      return reply.code(500).send({ error: String(err) })
+    }
+  })
+
+  // The per-product fallback price. null clears it, sending price resolution
+  // back to "narx belgilanmagan" for any client without an override.
+  app.put('/api/categories/:id/price', (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const id = idParam(req.params.id)
+    if (!id) return reply.code(400).send({ error: E.badId })
+
+    const { default_price } = req.body ?? {}
+    const clearing = default_price === null
+    if (!clearing && !isMoney(default_price)) return reply.code(400).send({ error: E.unitPrice })
+
+    const target = stockTarget(id)
+    if (!target.ok) return reply.code(400).send({ error: target.error })
+
+    try {
+      tx(() => q.setDefault.run(clearing ? null : default_price, id))
+      return reply.send({ id, default_price: clearing ? null : default_price })
+    } catch (err) {
+      return reply.code(500).send({ error: String(err) })
+    }
+  })
+
+  // ─── Ledger (write) ─────────────────────────────────────────────────────────
+
+  /** Shared front half of handover/return: guards, price, held quantity. */
+  function prepareMovement(req, reply, kind) {
+    const id = idParam(req.params.id)
+    if (!id) { reply.code(400).send({ error: E.badId }); return null }
+
+    const { category_id, qty } = req.body ?? {}
+    if (!Number.isInteger(category_id) || category_id < 1)
+      { reply.code(400).send({ error: E.catNotFound }); return null }
+    if (!isQty(qty)) { reply.code(400).send({ error: E.qty }); return null }
+
+    const client = q.getClient.get(id)
+    if (!client) { reply.code(404).send({ error: E.clientNotFound }); return null }
+
+    const target = stockTarget(category_id)
+    if (!target.ok) { reply.code(400).send({ error: target.error }); return null }
+
+    const unitPrice = resolvePrice(id, category_id)
+    if (unitPrice == null) { reply.code(400).send({ error: E.noPrice }); return null }
+
+    if (kind === 'return') {
+      const { held } = q.heldQty.get(id, category_id)
+      if (qty > held) {
+        reply.code(409).send({ error: `mijozda bu mahsulotdan ${held} dona bor`, held })
+        return null
+      }
+    }
+    return { client, id, category_id, qty, unitPrice, note: cleanNote(req.body?.note) }
+  }
+
+  function insertAndReply(reply, user, client, row) {
+    try {
+      const entryId = tx(() => {
+        q.insLedger.run(
+          client.id, row.kind, row.category_id ?? null, row.qty ?? null,
+          row.unit_price ?? null, row.amount, row.note ?? null,
+          user?.id ?? null, user?.first_name ?? user?.username ?? null,
+          row.reverses_id ?? null,
+        )
+        return q.lastId.get().id
+      })
+      const entry   = withPath(q.entry.get(entryId))
+      const balance = balanceOf(client.id)
+      post(client, entry, balance)   // after COMMIT, never awaited
+      return reply.send({ entry, balance })
+    } catch (err) {
+      return reply.code(500).send({ error: String(err) })
+    }
+  }
+
+  // handover → amount = +qty * unit_price
+  app.post('/api/clients/:id/handover', (req, reply) => {
+    const user = requireAuth(req, reply)
+    if (!user) return
+    const m = prepareMovement(req, reply, 'handover')
+    if (!m) return
+    return insertAndReply(reply, user, m.client, {
+      kind: 'handover',
+      category_id: m.category_id,
+      qty: m.qty,
+      unit_price: m.unitPrice,
+      amount: m.qty * m.unitPrice,
+      note: m.note,
+    })
+  })
+
+  // return → amount = -qty * unit_price, capped at what the client still holds
+  app.post('/api/clients/:id/return', (req, reply) => {
+    const user = requireAuth(req, reply)
+    if (!user) return
+    const m = prepareMovement(req, reply, 'return')
+    if (!m) return
+    return insertAndReply(reply, user, m.client, {
+      kind: 'return',
+      category_id: m.category_id,
+      qty: m.qty,
+      unit_price: m.unitPrice,
+      amount: -(m.qty * m.unitPrice),
+      note: m.note,
+    })
+  })
+
+  // payment → amount = -amount
+  app.post('/api/clients/:id/payment', (req, reply) => {
+    const user = requireAuth(req, reply)
+    if (!user) return
+    const id = idParam(req.params.id)
+    if (!id) return reply.code(400).send({ error: E.badId })
+
+    const { amount } = req.body ?? {}
+    if (!isMoney(amount)) return reply.code(400).send({ error: E.amount })
+
+    const client = q.getClient.get(id)
+    if (!client) return reply.code(404).send({ error: E.clientNotFound })
+
+    return insertAndReply(reply, user, client, {
+      kind: 'payment',
+      amount: -amount,
+      note: cleanNote(req.body?.note),
+    })
+  })
+
+  // A correction is an opposite row, never an UPDATE. The reversal keeps the
+  // original's kind/category/qty/unit_price so the ledger still reads as a pair,
+  // and carries the opposite amount — which is what the balance sums.
+  app.post('/api/ledger/:entryId/reverse', (req, reply) => {
+    const user = requireAuth(req, reply)
+    if (!user) return
+    const entryId = idParam(req.params.entryId)
+    if (!entryId) return reply.code(400).send({ error: E.badId })
+    const note = cleanNote(req.body?.note)
+
+    try {
+      const out = tx(() => {
+        const orig = q.rawEntry.get(entryId)
+        if (!orig) return { code: 404, body: { error: E.entryNotFound } }
+        if (orig.reverses_id != null) return { code: 409, body: { error: E.isReversal } }
+        if (q.reversalOf.get(entryId)) return { code: 409, body: { error: E.alreadyRev } }
+
+        const client = q.getClient.get(orig.client_id)
+        if (!client) return { code: 409, body: { error: E.clientNotFound } }
+
+        q.insLedger.run(
+          orig.client_id, orig.kind, orig.category_id, orig.qty, orig.unit_price,
+          -orig.amount, note ?? `Bekor qilindi #${entryId}`,
+          user?.id ?? null, user?.first_name ?? user?.username ?? null,
+          entryId,
+        )
+        return { code: 200, id: q.lastId.get().id, client }
+      })
+      if (out.code !== 200) return reply.code(out.code).send(out.body)
+
+      const entry   = withPath(q.entry.get(out.id))
+      const balance = balanceOf(out.client.id)
+      post(out.client, entry, balance)
+      return reply.send({ entry, balance })
+    } catch (err) {
+      return reply.code(500).send({ error: String(err) })
+    }
+  })
+}
+
+export { MAX_QTY, MAX_MONEY, KINDS }

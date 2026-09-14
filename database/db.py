@@ -25,6 +25,7 @@ async def init_db():
         for sql in [
             "ALTER TABLE users ADD COLUMN username TEXT",
             "ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'approved'",
+            "ALTER TABLE product_categories ADD COLUMN default_price INTEGER",
         ]:
             try:
                 await conn.execute(text(sql))

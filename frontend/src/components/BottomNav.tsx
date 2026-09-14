@@ -3,9 +3,10 @@ import type { Page } from '../types'
 interface Props { page: Page; setPage: (p: Page) => void }
 
 const TABS: { id: Page; label: string }[] = [
-  { id: 'action',   label: 'Kirish/Chiqish' },
-  { id: 'history',  label: 'Hisobot'         },
-  { id: 'products', label: 'Mahsulotlar'     },
+  { id: 'action',   label: 'Kirim/Chiqim' },
+  { id: 'history',  label: 'Hisobot'      },
+  { id: 'products', label: 'Mahsulot'     },
+  { id: 'clients',  label: 'Mijozlar'     },
 ]
 
 export default function BottomNav({ page, setPage }: Props) {
@@ -25,7 +26,7 @@ export default function BottomNav({ page, setPage }: Props) {
           const active = page === tab.id
           return (
             <button key={tab.id} onClick={() => setPage(tab.id)}
-                    className="flex flex-1 items-center justify-center py-3 rounded-xl text-sm transition-all active:scale-95"
+                    className="flex flex-1 items-center justify-center py-3 rounded-xl text-xs transition-all active:scale-95"
                     style={active
                       ? {
                           background: 'var(--tg-theme-button-color)',

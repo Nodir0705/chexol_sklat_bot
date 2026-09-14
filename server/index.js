@@ -8,6 +8,10 @@ import compress from '@fastify/compress'
 import staticFiles from '@fastify/static'
 import cors from '@fastify/cors'
 import ExcelJS from 'exceljs'
+import { migrate } from './schema.js'
+import clientRoutes from './clients.js'
+import statementRoutes from './statement.js'
+import { makeNotifier } from './notify.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 dotenvConfig({ path: join(__dirname, '..', '.env') })
@@ -32,6 +36,10 @@ try { db.exec("ALTER TABLE stock_transactions ADD COLUMN action_type TEXT DEFAUL
 try { db.exec("ALTER TABLE product_categories  ADD COLUMN deleted_at DATETIME NULL") } catch {}
 try { db.exec("ALTER TABLE users ADD COLUMN username TEXT") } catch {}
 try { db.exec("ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'approved'") } catch {}
+
+// Client ledger tables. Kept in schema.js so the DDL has exactly one owner --
+// clients.js used to carry a second copy that disagreed on index names.
+migrate(db)
 
 // ─── Prepared statements ───────────────────────────────────────────────────────
 
@@ -312,9 +320,26 @@ async function buildWorkbook(period = 'all') {
 // ─── Fastify ──────────────────────────────────────────────────────────────────
 
 const app = Fastify({ logger: false })
+
+// Routes whose body is entirely optional (POST .../reverse with no note) would
+// otherwise get FST_ERR_CTP_EMPTY_JSON_BODY from a client that sets the JSON
+// content-type and sends nothing. Treat an empty body as {}.
+app.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body, done) => {
+  if (!body || !body.trim()) return done(null, {})
+  try { done(null, JSON.parse(body)) }
+  catch { const e = new Error('invalid json'); e.statusCode = 400; done(e) }
+})
+
 await app.register(cors, { origin: true })
 await app.register(compress, { global: true })
 await app.register(staticFiles, { root: FRONTEND })
+
+// ─── Client ledger (Mijozlar) ─────────────────────────────────────────────────
+// Receipts post to the client's group after the ledger row commits; notify()
+// never throws, so a Telegram outage cannot block the owner recording business.
+const notify = makeNotifier(BOT_TOKEN)
+await app.register(clientRoutes,    { db, requireAuth, requireRead, notify })
+await app.register(statementRoutes, { db, requireAuth, requireRead, botToken: BOT_TOKEN })
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
