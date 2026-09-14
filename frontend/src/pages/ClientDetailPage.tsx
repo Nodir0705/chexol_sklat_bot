@@ -1126,7 +1126,11 @@ function GroupLinkCard({ clientId, chatId }: { clientId: number; chatId: number 
       </p>
       <div className="flex gap-2">
         <input value={code}
-               onChange={e => setCode(e.target.value.toUpperCase().slice(0, 8))}
+               onChange={e => setCode(
+                 // Codes get pasted with the stray spaces and dashes people add
+                 // when reading them aloud off another phone.
+                 e.target.value.replace(/[^a-zA-Z0-9]/g, '').toUpperCase().slice(0, 6)
+               )}
                onKeyDown={e => { if (e.key === 'Enter') submit() }}
                placeholder="ABC123"
                autoCapitalize="characters"
@@ -1134,7 +1138,7 @@ function GroupLinkCard({ clientId, chatId }: { clientId: number; chatId: number 
                spellCheck={false}
                className="flex-1 min-w-0 px-3 py-2.5 rounded-xl text-sm tracking-widest text-center outline-none"
                style={{ background: 'var(--tg-theme-bg-color)', color: 'var(--tg-theme-text-color)' }} />
-        <button onClick={submit} disabled={link.isPending || code.trim().length < 4}
+        <button onClick={submit} disabled={link.isPending || code.trim().length < 6}
                 className="px-4 py-2.5 rounded-xl text-sm font-bold shrink-0 active:scale-95 transition-all disabled:opacity-40"
                 style={{ background: ACCENT, color: 'var(--tg-theme-button-text-color)' }}>
           {link.isPending ? '...' : 'Ulash'}

@@ -231,11 +231,16 @@ async def ulash(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Kod yaratib bo'lmadi. Birozdan keyin qayta urinib ko'ring.")
         return
 
+    # The code is alone on its own line inside <code>: Telegram copies the whole
+    # entity on tap, so a bare line is a big, unambiguous target -- "Kod: ABC234"
+    # on one line makes you hit six characters exactly.
     await message.reply_html(
         f"🔗 Guruh: <b>{html.escape(title)}</b>\n\n"
-        f"Kod: <code>{code}</code>\n\n"
-        "Ushbu kodni Mini App'da mijoz kartochkasiga kiriting — shundan keyin "
-        "har bir berish, qaytarish va to'lov shu guruhga yoziladi.\n"
+        f"<code>{code}</code>\n"
+        "👆 Kodni bosing — nusxalanadi\n\n"
+        "So'ng Mini App → Mijozlar → mijozni tanlang → kodni qo'ying va "
+        "<b>Ulash</b> tugmasini bosing. Shundan keyin har bir berish, qaytarish "
+        "va to'lov shu guruhga yoziladi.\n"
         f"⏳ Kod {CODE_TTL_MINUTES} daqiqa amal qiladi va faqat bir marta ishlatiladi."
     )
 
