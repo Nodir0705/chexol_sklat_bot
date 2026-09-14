@@ -252,10 +252,10 @@ async def ulash(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text=
         f"🔗 Guruh: <b>{html.escape(title)}</b>\n\n"
         f"<code>{code}</code>\n\n"
-        "Mini App → Mijozlar → mijozni tanlang → kodni qo'ying va "
-        "<b>Ulash</b> tugmasini bosing. Shundan keyin har bir berish, qaytarish "
-        "va to'lov shu guruhga yoziladi.\n"
-        f"⏳ Kod {CODE_TTL_MINUTES} daqiqa amal qiladi va faqat bir marta ishlatiladi."
+        "Mini App → Mijozlar → mijozni tanlang → kodni kiriting va "
+        "<b>Ulash</b> tugmasini bosing.\n"
+        "Shundan keyin har bir berish, qaytarish va to'lov shu guruhga yoziladi.\n"
+        f"<i>Kod {CODE_TTL_MINUTES} daqiqa amal qiladi va faqat bir marta ishlatiladi.</i>"
         + ("" if CopyTextButton is not None else "\n\n👆 Kodni bosib nusxalang.")
     )
 
