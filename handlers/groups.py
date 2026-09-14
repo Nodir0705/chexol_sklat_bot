@@ -15,7 +15,14 @@ import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+
+# CopyTextButton landed in Bot API 7.11 / PTB 21.7. requirements.txt allows 21.6,
+# so degrade to the plain <code> line rather than crashing on an older install.
+try:
+    from telegram import CopyTextButton
+except ImportError:  # pragma: no cover
+    CopyTextButton = None
 from telegram.constants import ChatMemberStatus, ChatType
 from telegram.ext import ContextTypes
 from sqlalchemy import text
@@ -231,17 +238,25 @@ async def ulash(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Kod yaratib bo'lmadi. Birozdan keyin qayta urinib ko'ring.")
         return
 
-    # The code is alone on its own line inside <code>: Telegram copies the whole
-    # entity on tap, so a bare line is a big, unambiguous target -- "Kod: ABC234"
-    # on one line makes you hit six characters exactly.
+    # Tapping a <code> entity copies the whole message on several clients, which
+    # is what a real user hit. A copy_text button copies exactly the code and
+    # nothing else, in one tap, with no text selection involved.
+    markup = None
+    if CopyTextButton is not None:
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📋 Kodni nusxalash", copy_text=CopyTextButton(text=code))]]
+        )
+
     await message.reply_html(
+        reply_markup=markup,
+        text=
         f"🔗 Guruh: <b>{html.escape(title)}</b>\n\n"
-        f"<code>{code}</code>\n"
-        "👆 Kodni bosing — nusxalanadi\n\n"
-        "So'ng Mini App → Mijozlar → mijozni tanlang → kodni qo'ying va "
+        f"<code>{code}</code>\n\n"
+        "Mini App → Mijozlar → mijozni tanlang → kodni qo'ying va "
         "<b>Ulash</b> tugmasini bosing. Shundan keyin har bir berish, qaytarish "
         "va to'lov shu guruhga yoziladi.\n"
         f"⏳ Kod {CODE_TTL_MINUTES} daqiqa amal qiladi va faqat bir marta ishlatiladi."
+        + ("" if CopyTextButton is not None else "\n\n👆 Kodni bosib nusxalang.")
     )
 
 
