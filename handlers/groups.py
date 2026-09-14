@@ -21,7 +21,7 @@ from telegram.ext import ContextTypes
 from sqlalchemy import text
 
 from database.db import engine
-from config import ADMIN_ID
+from config import ADMIN_ID, APPROVED_IDS
 
 logger = logging.getLogger(__name__)
 
@@ -198,7 +198,7 @@ async def redeem_code(code, client_id):
 # ─── Handlers ──────────────────────────────────────────────────────────────────
 
 async def ulash(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/ulash — admin-only, group-only. Replies with the group title and a code."""
+    """/ulash — operator-only, group-only. Replies with the group title and a code."""
     chat = update.effective_chat
     user = update.effective_user
     message = update.effective_message
@@ -211,11 +211,16 @@ async def ulash(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Linking a group hands the ledger a place to publish receipts, so the sender
     # is checked here — unlike the approve/reject callbacks, which trust whoever taps.
-    if not ADMIN_ID or user is None or user.id != ADMIN_ID:
+    #
+    # Telegram group ownership is irrelevant: the gate is the bot's own operator
+    # list. ADMIN_ID alone was too narrow — it locked out the person who actually
+    # runs the warehouse whenever ADMIN_ID points at a different account.
+    allowed = {i for i in ({ADMIN_ID} | set(APPROVED_IDS)) if i}
+    if not allowed or user is None or user.id not in allowed:
         logger.warning(
             "Refused /ulash from user %s in chat %s", getattr(user, "id", None), chat.id
         )
-        await message.reply_text("⛔️ Bu buyruq faqat admin uchun.")
+        await message.reply_text("⛔️ Bu buyruq faqat sklat operatorlari uchun.")
         return
 
     title = chat.title or str(chat.id)
