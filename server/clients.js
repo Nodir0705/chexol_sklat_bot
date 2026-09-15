@@ -42,12 +42,18 @@ const E = {
   tooManyItems:   `bir vaqtda ko'pi bilan ${MAX_BATCH} ta mahsulot yuborish mumkin`,
 }
 
-// Receipts post as a rendered picture. The owner weighed text, poll and image:
-// the poll card cannot be edited at all and caps at 10 products, and plain text
-// has no visual weight in a busy group -- only the image gives both the card
-// look and editMessageMedia, which is how a correction rewrites the post it
-// corrects. RECEIPT_IMAGES=0 falls back to text receipts.
-const RECEIPT_IMAGES = process.env.RECEIPT_IMAGES !== '0'
+// Receipts post as TEXT. The owner tried all three formats in the real groups
+// and chose this one.
+//
+// The deciding constraint is not visual: Telegram never lets one account edit
+// another account's message, a bot's included, so a posted receipt can only
+// ever be changed by the bot itself. A picture makes that gap feel worse --
+// it looks like a document, so not being able to touch it reads as broken --
+// while a text receipt is at least quotable, searchable and copyable by hand.
+//
+// The renderer, the stamp bookkeeping and the correction flow all remain and
+// all still work; RECEIPT_IMAGES=1 turns pictures back on with no other change.
+const RECEIPT_IMAGES = process.env.RECEIPT_IMAGES === '1'
 
 export default async function clientRoutes(app, { db, requireAuth, requireRead, notify } = {}) {
   // ─── Schema ─────────────────────────────────────────────────────────────────
