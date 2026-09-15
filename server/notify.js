@@ -32,7 +32,7 @@ const NBSP  = ' '
 const MINUS = '−' // U+2212, the adjustment sign — not an ASCII hyphen
 
 // Exactly one owner-controlled emoji per message, always character 1.
-const KIND_UI = {
+export const KIND_UI = {
   handover:   { icon: '📦', label: 'Berildi' },
   return:     { icon: '↩️', label: 'Qaytarildi' },
   payment:    { icon: '💵', label: "To'landi" },
@@ -197,7 +197,7 @@ function toDate(at) {
 }
 
 /** DD.MM.YYYY HH:MM in Tashkent time (UTC+5, no DST). */
-function tashkentStamp(at) {
+export function tashkentStamp(at) {
   const t = new Date(toDate(at).getTime() + TASHKENT_OFFSET_MS)
   const p = n => String(n).padStart(2, '0')
   return `${p(t.getUTCDate())}.${p(t.getUTCMonth() + 1)}.${t.getUTCFullYear()}` +

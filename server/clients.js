@@ -13,7 +13,7 @@
 // All money is integer so'm — no floats anywhere in the money path.
 
 import { migrate } from './schema.js'
-import { formatReceipt, formatBatchReceipt, productLabel } from './notify.js'
+import { formatReceipt, formatBatchReceipt, productLabel, tashkentStamp, KIND_UI } from './notify.js'
 import { receiptSvg, receiptCaption } from './receipt-image.js'
 
 const MAX_QTY   = 99999          // matches the Mini App's quantity input cap
@@ -246,12 +246,18 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
     return {
       kind: orig ? 'reversal' : entries[0].kind,
       client: client?.name ?? '',
-      at: entries[0].created_at,
+      // The card prints r.at verbatim -- formatting is the caller's job, and a
+      // raw SQL stamp shipped "2026-09-15 10:04:00" onto a client's receipt.
+      at: tashkentStamp(entries[0].created_at),
       note: note ?? entries[0].note ?? null,
       balance,
       delta: entries.reduce((a, e) => a + (e.amount || 0), 0),
       total: Math.abs(entries.reduce((a, e) => a + (e.amount || 0), 0)),
-      orig: orig ? { kind: orig.kind, at: orig.created_at } : null,
+      // The reversal reference names what was cancelled: its label AND its stamp.
+      orig: orig
+        ? { label: (KIND_UI[orig.kind] ?? KIND_UI.adjustment).label,
+            at: tashkentStamp(orig.created_at) }
+        : null,
       items: rows.map(e => ({
         label: productLabel(e.category_name, e.parent_name),
         qty: e.qty, amount: e.amount, unit_price: e.unit_price,
