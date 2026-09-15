@@ -41,10 +41,12 @@ const E = {
   tooManyItems:   `bir vaqtda ko'pi bilan ${MAX_BATCH} ta mahsulot yuborish mumkin`,
 }
 
-// Receipts post as text. The rendered picture is kept behind this flag: the
-// owner found the image harder to correct than a message, and text stays
-// searchable, copyable and cheap to edit. Set RECEIPT_IMAGES=1 to post pictures.
-const RECEIPT_IMAGES = process.env.RECEIPT_IMAGES === '1'
+// Receipts post as a rendered picture. The owner weighed text, poll and image:
+// the poll card cannot be edited at all and caps at 10 products, and plain text
+// has no visual weight in a busy group -- only the image gives both the card
+// look and editMessageMedia, which is how a correction rewrites the post it
+// corrects. RECEIPT_IMAGES=0 falls back to text receipts.
+const RECEIPT_IMAGES = process.env.RECEIPT_IMAGES !== '0'
 
 export default async function clientRoutes(app, { db, requireAuth, requireRead, notify } = {}) {
   // ─── Schema ─────────────────────────────────────────────────────────────────
