@@ -20,6 +20,8 @@
 // Every failure is one log line and a { ok: false, error } return value.
 
 const TASHKENT_OFFSET_MS = 5 * 60 * 60 * 1000
+import { existsSync } from 'node:fs'
+
 const TELEGRAM_TIMEOUT_MS = 10_000
 
 // U+00A0. Money never wraps: the digit groups AND the gap before "so'm" are
@@ -363,12 +365,25 @@ export function formatBatchReceipt(entries, balance, opts = {}) {
 /** Rasterise an SVG receipt to PNG. Kept behind a lazy import so a renderer
  *  fault can never stop the server booting -- the ledger write matters more
  *  than the picture, and notifyReceipt falls back to text on any failure. */
+const FONT_FILES = [
+  '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+  '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+]
+
 async function renderPng(svg) {
   const { Resvg } = await import('@resvg/resvg-js')
+  // Load the faces by PATH. loadSystemFonts relies on fontconfig, which this
+  // image does not install -- the .ttf files are present but undiscoverable, so
+  // every glyph silently rendered as nothing and receipts arrived as empty
+  // boxes and rules. Explicit paths need no fontconfig and pin the exact faces
+  // the advance table in metrics.json was measured from.
+  const fontFiles = FONT_FILES.filter(f => existsSync(f))
+  if (!fontFiles.length) throw new Error('no font files found — refusing to render textless receipt')
+
   // The SVG declares its own width/height (1080 wide, 3x the 360pt layout), so
   // 'original' is right -- forcing a width would rescale an already-scaled card.
   return new Resvg(String(svg), {
-    font: { loadSystemFonts: true, defaultFontFamily: 'DejaVu Sans' },
+    font: { loadSystemFonts: false, fontFiles, defaultFontFamily: 'DejaVu Sans' },
     fitTo: { mode: 'original' },
   }).render().asPng()
 }
@@ -419,7 +434,7 @@ export function makeNotifier(botToken) {
    *  Falls back to the text receipt on ANY rendering or upload failure. A
    *  picture is a nicety; the client being told what they received is not.
    */
-  notify.receipt = async function sendReceipt(chatId, { svg, caption, text }) {
+  notify.receipt = async function sendReceipt(chatId, { svg, caption, text, followUp = null }) {
     if (chatId === null || chatId === undefined || chatId === '') {
       return { ok: false, skipped: true }
     }
@@ -430,6 +445,9 @@ export function makeNotifier(botToken) {
       const form = new FormData()
       form.append('chat_id', String(chatId))
       form.append('photo', new Blob([png], { type: 'image/png' }), 'receipt.png')
+      if (caption != null && typeof caption !== 'string') {
+        throw new TypeError('caption must be a string, got ' + typeof caption)
+      }
       form.append('caption', String(caption ?? '').slice(0, 1024))
       form.append('parse_mode', 'HTML')
       const res = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
@@ -437,6 +455,7 @@ export function makeNotifier(botToken) {
       })
       const json = await res.json()
       if (!json || json.ok !== true) throw new Error(json?.description ?? `http_${res.status}`)
+      if (followUp) await notify(chatId, followUp)
       return { ok: true, messageId: json.result?.message_id, photo: true }
     } catch (err) {
       console.warn(`[notify] chat ${chatId}: photo failed (${err?.message ?? err}) — sending text`)
