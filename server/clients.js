@@ -13,7 +13,8 @@
 // All money is integer so'm — no floats anywhere in the money path.
 
 import { migrate } from './schema.js'
-import { formatReceipt, formatBatchReceipt } from './notify.js'
+import { formatReceipt, formatBatchReceipt, productLabel } from './notify.js'
+import { receiptSvg, receiptCaption } from './receipt-image.js'
 
 const MAX_QTY   = 99999          // matches the Mini App's quantity input cap
 const MAX_MONEY = 10_000_000_000 // so'm; qty*unit_price stays well under 2^53
@@ -237,8 +238,51 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
     } catch {}
   }
 
+  /** Shape a movement for the image renderer. Direction comes from the SIGNED
+   *  sum, never the kind word — a reversal of a payment raises the debt while
+   *  its header still reads "Bekor qilindi". */
+  function receiptData(client, entries, balance, note, orig = null) {
+    const rows = entries.filter(e => e.category_id != null)
+    return {
+      kind: orig ? 'reversal' : entries[0].kind,
+      client: client?.name ?? '',
+      at: entries[0].created_at,
+      note: note ?? entries[0].note ?? null,
+      balance,
+      delta: entries.reduce((a, e) => a + (e.amount || 0), 0),
+      total: Math.abs(entries.reduce((a, e) => a + (e.amount || 0), 0)),
+      orig: orig ? { kind: orig.kind, at: orig.created_at } : null,
+      items: rows.map(e => ({
+        label: productLabel(e.category_name, e.parent_name),
+        qty: e.qty, amount: e.amount, unit_price: e.unit_price,
+      })),
+    }
+  }
+
+  /** Picture first, text as the fallback inside notify.receipt. */
+  function postReceipt(client, entries, balance, note, orig = null) {
+    if (typeof notify !== 'function') return
+    if (!client || client.telegram_chat_id == null) return
+    try {
+      const data = receiptData(client, entries, balance, note, orig)
+      const text = entries.length === 1
+        ? formatReceipt(entries[0], balance, orig)
+        : formatBatchReceipt(entries, balance, { note })
+      const send = typeof notify.receipt === 'function'
+        ? notify.receipt(client.telegram_chat_id,
+            { svg: receiptSvg(data), caption: receiptCaption(data), text })
+        : notify(client.telegram_chat_id, text)
+      Promise.resolve(send).catch(() => {})
+    } catch (err) {
+      // Rendering blew up -- still tell the client what they received.
+      try { postText(client, () => entries.length === 1
+        ? formatReceipt(entries[0], balance, orig)
+        : formatBatchReceipt(entries, balance, { note })) } catch {}
+    }
+  }
+
   function post(client, entry, balance, orig = null) {
-    postText(client, () => formatReceipt(entry, balance, orig))
+    postReceipt(client, [entry], balance, null, orig)
   }
 
   /**
@@ -253,8 +297,7 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
    * all the rows of a batch are written in one transaction.
    */
   function postMovement(client, entries, balance, note) {
-    if (entries.length === 1) return post(client, entries[0], balance)
-    postText(client, () => formatBatchReceipt(entries, balance, { note }))
+    postReceipt(client, entries, balance, note)
   }
 
   /** Run fn inside a transaction; fn returns the value to hand back. */
