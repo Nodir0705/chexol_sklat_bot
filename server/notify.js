@@ -365,9 +365,11 @@ export function formatBatchReceipt(entries, balance, opts = {}) {
  *  than the picture, and notifyReceipt falls back to text on any failure. */
 async function renderPng(svg) {
   const { Resvg } = await import('@resvg/resvg-js')
-  return new Resvg(svg, {
+  // The SVG declares its own width/height (1080 wide, 3x the 360pt layout), so
+  // 'original' is right -- forcing a width would rescale an already-scaled card.
+  return new Resvg(String(svg), {
     font: { loadSystemFonts: true, defaultFontFamily: 'DejaVu Sans' },
-    fitTo: { mode: 'width', value: 1080 },
+    fitTo: { mode: 'original' },
   }).render().asPng()
 }
 

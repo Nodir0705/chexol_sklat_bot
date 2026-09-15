@@ -268,9 +268,11 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
       const text = entries.length === 1
         ? formatReceipt(entries[0], balance, orig)
         : formatBatchReceipt(entries, balance, { note })
+      // receiptSvg returns { svg, width, height, ... } -- the markup is .svg
+      const card = receiptSvg(data)
       const send = typeof notify.receipt === 'function'
         ? notify.receipt(client.telegram_chat_id,
-            { svg: receiptSvg(data), caption: receiptCaption(data), text })
+            { svg: card.svg, caption: receiptCaption(data), text })
         : notify(client.telegram_chat_id, text)
       Promise.resolve(send).catch(() => {})
     } catch (err) {
