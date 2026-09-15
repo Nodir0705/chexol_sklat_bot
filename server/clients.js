@@ -15,6 +15,7 @@
 import { migrate } from './schema.js'
 import { formatReceipt, formatBatchReceipt, productLabel, tashkentStamp, KIND_UI } from './notify.js'
 import { receiptSvg } from './receipt-image.js'
+import { makeReceiptLog } from './receipt-log.js'
 
 const MAX_QTY   = 99999          // matches the Mini App's quantity input cap
 const MAX_MONEY = 10_000_000_000 // so'm; qty*unit_price stays well under 2^53
@@ -145,6 +146,14 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
     lastId:   db.prepare('SELECT last_insert_rowid() AS id'),
   }
 
+  // ─── Receipt post bookkeeping ───────────────────────────────────────────────
+  // Which Telegram message carried which ledger rows, so a later reversal can
+  // STAMP that message instead of restating it. Pure display state: see
+  // server/receipt-log.js. `build` is a hoisted function declaration further
+  // down this closure — receipt-log.js imports NOTHING from here, so the
+  // dependency runs one way only.
+  const log = makeReceiptLog({ db, notify, build })
+
   // ─── Validation ─────────────────────────────────────────────────────────────
   //
   // The stock routes once checked qty for truthiness only, which let -500, 0.5,
@@ -237,12 +246,18 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
    *  owner recording business, and the row is already committed by now. The
    *  text is rendered INSIDE the try: a formatter fed owner-entered text is one
    *  more thing that must not reach the reply. */
-  function postText(client, render) {
-    if (typeof notify !== 'function') return
-    if (!client || client.telegram_chat_id == null) return
+  function postText(client, render, { postId = null, replyTo = null, snapshot = null } = {}) {
+    if (typeof notify !== 'function') return Promise.resolve()
+    if (!client || client.telegram_chat_id == null) return Promise.resolve()
     try {
-      Promise.resolve(notify(client.telegram_chat_id, render())).catch(() => {})
-    } catch {}
+      const p = Promise.resolve(notify(client.telegram_chat_id, render(), { replyTo }))
+        .then(res => { if (postId) log.settle(postId, res, { caption: null, snapshot }) })
+        .catch(() => {})            // ← TERMINAL. See postReceipt.
+      if (postId) log.track(postId, p)
+      return p
+    } catch {
+      return Promise.resolve()
+    }
   }
 
   const somCap = n => String(Math.abs(Math.trunc(n || 0)))
@@ -279,50 +294,147 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
             at: tashkentStamp(orig.created_at) }
         : null,
       items: rows.map(e => ({
+        // `id` is carried for build(): the renderer ignores it, but `rows` is
+        // entries FILTERED to category rows, so the items index is NOT the
+        // entries index once a payment row is in play. The id is the only way
+        // to map a cancelled ledger row onto the right item.
+        id: e.id,
         label: productLabel(e.category_name, e.parent_name),
         qty: e.qty, amount: e.amount, unit_price: e.unit_price,
       })),
     }
   }
 
-  /** Picture first, text as the fallback inside notify.receipt. */
-  function postReceipt(client, entries, balance, note, orig = null) {
-    if (typeof notify !== 'function') return
-    if (!client || client.telegram_chat_id == null) return
+  /**
+   * The RENDER INPUTS of a card, frozen as JSON at post time.
+   *
+   * Inputs, not receiptData's output: the text stamp path calls
+   * formatBatchReceipt, which takes entry-shaped rows and calls productLabel
+   * itself. This is what makes the additive invariant real — receiptData reads
+   * category_name/parent_name from a live JOIN on product_categories and the
+   * name from a mutable clients row, so without the snapshot a category rename
+   * would silently change what an ALREADY-ISSUED card prints. It also means a
+   * 50-row stamp costs zero joins.
+   */
+  function snapshotOf(client, entries, balance, note, orig) {
+    return JSON.stringify({
+      client: { name: client?.name ?? '' },
+      entries,
+      note: note ?? null,
+      balance,
+      orig: orig ? { kind: orig.kind, created_at: orig.created_at } : null,
+    })
+  }
+
+  /**
+   * Re-render a posted card with cancellation ink added and NOTHING else moved.
+   * Injected into receipt-log.js, which therefore imports nothing from here.
+   *
+   * @param {object} post          the receipt_posts row
+   * @param {number[]} cancelledIds ledger ids struck by this edit
+   * @param {{count:number, all:boolean, at:string}} correction
+   */
+  function build(post, cancelledIds, correction) {
+    const snap = JSON.parse(post.snapshot)
+    const set  = new Set(cancelledIds)
+    const isPhoto = post.is_photo === 1
+
+    const text = snap.entries.length === 1
+      ? formatReceipt(snap.entries[0], snap.balance, snap.orig, { cancelled: set, correction })
+      : formatBatchReceipt(snap.entries, snap.balance, { note: snap.note, cancelled: set, correction })
+
+    // The picture is built ONLY for a card that is a picture. A text card is
+    // very often a card whose render already failed once; re-rendering it here
+    // would make that card the one card that can never be stamped.
+    let svg = null
+    if (isPhoto) {
+      const data = receiptData(snap.client, snap.entries, snap.balance, snap.note, snap.orig)
+      data.items.forEach(it => { if (set.has(it.id)) it.cancelled = true })
+      data.correction = correction
+      svg = receiptSvg(data).svg
+    }
+
+    const head = `❌ <b>BEKOR QILINDI</b> · ${correction.count} qator · ${correction.at}`
+               + ` — yangi kvitansiyaga qarang`
+    const full = `${head}\n<s>${post.caption ?? ''}</s>`
+    // Never slice the stored caption: it already contains HTML entities and a
+    // cut entity is a message Telegram refuses. compactCaption is ~80 chars, so
+    // this fallback is unreachable in practice — it exists so it can never be hit.
+    const caption = full.length <= 1024 ? full : head
+
+    return { svg, caption, text, isPhoto }
+  }
+
+  /** Picture first, text as the fallback inside notify.receipt.
+   *
+   *  Returns the send promise so a correction can wait for the message id, and
+   *  settles the reserved receipt_posts row from the RESULT. Both are optional:
+   *  with no postId this behaves exactly as it did before. */
+  function postReceipt(client, entries, balance, note, orig = null,
+                       { postId = null, replyTo = null } = {}) {
+    if (typeof notify !== 'function') return Promise.resolve()
+    if (!client || client.telegram_chat_id == null) return Promise.resolve()
+    // Declared outside the try so the outer catch's postText fallback can still
+    // settle from it, but BUILT INSIDE it: a throw out here would land in
+    // insertAndReply's catch AFTER COMMIT and answer 500 for a delivery that is
+    // already on disk — the one thing this design exists to make impossible.
+    let snapshot = null
     try {
+      snapshot = postId ? snapshotOf(client, entries, balance, note, orig) : null
       const text = entries.length === 1
         ? formatReceipt(entries[0], balance, orig)
         : formatBatchReceipt(entries, balance, { note })
 
       let send
+      let caption = null
       if (RECEIPT_IMAGES && typeof notify.receipt === 'function') {
         // Built only when pictures are on: receiptSvg walks the whole layout,
         // which is real work to throw away on every text receipt.
         // receiptSvg returns { svg, width, height, ... } -- the markup is .svg.
         const data = receiptData(client, entries, balance, note, orig)
+        // One line, not the item list: the picture already carries that, and
+        // repeating it underneath reads as the message sent twice. What a
+        // caption still buys is what a picture cannot do -- appear in a push
+        // notification, be found by search, be read aloud.
+        caption = compactCaption(data)
         send = notify.receipt(client.telegram_chat_id, {
           svg: receiptSvg(data).svg,
-          // One line, not the item list: the picture already carries that, and
-          // repeating it underneath reads as the message sent twice. What a
-          // caption still buys is what a picture cannot do -- appear in a push
-          // notification, be found by search, be read aloud.
-          caption: compactCaption(data),
+          caption,
           text,
+          replyTo,
         })
       } else {
-        send = notify(client.telegram_chat_id, text)
+        send = notify(client.telegram_chat_id, text, { replyTo })
       }
-      Promise.resolve(send).catch(() => {})
+
+      // THE TERMINAL .catch IS A CORRECTNESS REQUIREMENT, NOT STYLE. `send`
+      // never rejects — notify and notify.receipt catch everything — so the
+      // only way into a rejection is a throw out of settle(), a synchronous
+      // DatabaseSync write that throws if the Python bot holds the file past
+      // PRAGMA busy_timeout. Without this catch that rejection reaches the
+      // unhandled-rejection handler and takes the SERVER down: a
+      // notification-bookkeeping failure killing the process, in a design whose
+      // whole thesis is that notification failures never propagate. settle() is
+      // ALSO internally try/catch'd — belt and braces.
+      const p = Promise.resolve(send)
+        .then(res => { if (postId) log.settle(postId, res, { caption, snapshot }) })
+        .catch(() => {})
+      if (postId) log.track(postId, p)
+      return p
     } catch (err) {
-      // Rendering blew up -- still tell the client what they received.
-      try { postText(client, () => entries.length === 1
-        ? formatReceipt(entries[0], balance, orig)
-        : formatBatchReceipt(entries, balance, { note })) } catch {}
+      // Rendering blew up -- still tell the client what they received, and
+      // settle the reserved row from THAT send, so a render-throw post is never
+      // left 'pending' (which would make it permanently unstampable).
+      try {
+        return postText(client, () => entries.length === 1
+          ? formatReceipt(entries[0], balance, orig)
+          : formatBatchReceipt(entries, balance, { note }), { postId, replyTo, snapshot })
+      } catch { return Promise.resolve() }
     }
   }
 
-  function post(client, entry, balance, orig = null) {
-    postReceipt(client, [entry], balance, null, orig)
+  function post(client, entry, balance, orig = null, opts = {}) {
+    return postReceipt(client, [entry], balance, null, orig, opts)
   }
 
   /**
@@ -336,11 +448,18 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
    * than to any one product. `at` is left to default to the first row's stamp —
    * all the rows of a batch are written in one transaction.
    */
-  function postMovement(client, entries, balance, note) {
-    postReceipt(client, entries, balance, note)
+  function postMovement(client, entries, balance, note, postId = null) {
+    return postReceipt(client, entries, balance, note, null, { postId })
   }
 
-  /** Run fn inside a transaction; fn returns the value to hand back. */
+  /** Run fn inside a transaction; fn returns the value to hand back.
+   *
+   *  NO ROUTE IN THIS PROCESS MAY OPEN A TRANSACTION AND THEN AWAIT. Every
+   *  BEGIN…COMMIT in this server is synchronous, and Node is single-threaded,
+   *  so a promise callback cannot interleave into synchronous code — which is
+   *  what makes receipt-log.js's fire-and-forget settle() UPDATE safe. If
+   *  someone later writes an async handler that opens a transaction, that
+   *  UPDATE could join it and vanish on its ROLLBACK. */
   function tx(fn) {
     db.exec('BEGIN')
     try {
@@ -658,10 +777,18 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
 
   function insertAndReply(reply, user, client, row) {
     try {
-      const entryId = tx(() => insertRow(user, client.id, row))
+      // The post row is reserved INSIDE the transaction — it is the only place
+      // the new ledger id is known and committed together with the reservation.
+      // log.record is internally try/catch'd, so its failure degrades to
+      // "not stampable" and can never roll this delivery back.
+      const { entryId, postId } = tx(() => {
+        const entryId = insertRow(user, client.id, row)   // reads lastId itself
+        const postId  = log.record(client, 'movement', [entryId])
+        return { entryId, postId }
+      })
       const entry   = withPath(q.entry.get(entryId))
       const balance = balanceOf(client.id)
-      post(client, entry, balance)   // after COMMIT, never awaited
+      post(client, entry, balance, null, { postId })   // after COMMIT, never awaited
       return reply.send({ entry, balance })
     } catch (err) {
       return reply.code(500).send({ error: String(err) })
@@ -766,13 +893,19 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
     try {
       // One transaction around every insert — a throw anywhere inside rolls the
       // whole movement back, so a batch can never land half-written.
-      const ids = tx(() => prepared.rows.map(row => insertRow(user, client.id, row)))
+      // 50 rows costs 51 extra statements inside a transaction already doing 50
+      // inserts, and the reservation commits with the rows it describes.
+      const { ids, postId } = tx(() => {
+        const ids    = prepared.rows.map(row => insertRow(user, client.id, row))
+        const postId = log.record(client, 'movement', ids)
+        return { ids, postId }
+      })
 
       const byId    = catIndex()   // built once, not once per row
       const entries = ids.map(entryId => withPath(q.entry.get(entryId), byId))
       const balance = balanceOf(client.id)
       const total   = entries.reduce((sum, e) => sum + e.amount, 0)
-      postMovement(client, entries, balance, note)   // after COMMIT, never awaited
+      postMovement(client, entries, balance, note, postId)   // after COMMIT, never awaited
       return reply.send({ entries, balance, total })
     } catch (err) {
       return reply.code(500).send({ error: String(err) })
@@ -828,20 +961,70 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
           user?.id ?? null, user?.first_name ?? user?.username ?? null,
           entryId,
         )
+        // `q.lastId` is SELECT last_insert_rowid(), so it must be read BEFORE
+        // log.record runs its own inserts. Reading it after would return a
+        // receipt_posts id where the reversal's LEDGER id belongs, and that
+        // wrong id would flow straight into q.entry.get() and into
+        // receipt_post_rows. FIRST. ALWAYS.
+        const revId  = q.lastId.get().id
+        const postId = log.record(client, 'reversal', [revId])   // clobbers lastId; harmless now
         // The cancelled row travels with the result: the receipt quotes its
         // label and its timestamp, and it is already in hand here.
-        return { code: 200, id: q.lastId.get().id, client, orig }
+        return { code: 200, id: revId, postId, client, orig }
       })
       if (out.code !== 200) return reply.code(out.code).send(out.body)
 
       const entry   = withPath(q.entry.get(out.id))
       const balance = balanceOf(out.client.id)
-      post(out.client, entry, balance, out.orig)
-      return reply.send({ entry, balance })
+      reply.send({ entry, balance })          // the API answers FIRST, as it does today
+      void correctionTail(out, entry, balance)
+      return reply
     } catch (err) {
       return reply.code(500).send({ error: String(err) })
     }
   })
+
+  /**
+   * Post the correction and stamp the card it corrects — a DETACHED async
+   * function with a terminal catch, started after reply.send(). tx() stays
+   * fully synchronous: the tail runs entirely outside it, so the
+   * no-await-around-a-transaction rule is preserved by the very change that
+   * introduces the first async work in this file.
+   *
+   * THE ORDERING PRINCIPLE: card B goes FIRST and is AWAITED. The correction
+   * record must exist in the group even if every edit in the system fails —
+   * that is what makes a failed edit UNDER-inform (today's shipped state: an
+   * intact original plus a correct reversal card) rather than MISINFORM. A
+   * stamp failure must never affect the correction post, and neither may touch
+   * the API response.
+   */
+  async function correctionTail(out, entry, balance) {
+    try {
+      let post = log.forEntry(out.orig.id)
+      if (post && post.state === 'pending') {
+        await log.settled(post.id)      // close the in-flight window
+        post = log.get(post.id)
+      }
+      // Thread card B under the original ONLY when that message lives in the
+      // chat card B is going to. POST /api/clients/:id/link nulls
+      // telegram_chat_id off whatever client held it and rebinds it, so after a
+      // re-link the stored chat and the live chat are different groups and this
+      // message_id would point at an unrelated message.
+      const live = out.client.telegram_chat_id
+      const replyTo = log.stampable(post) && String(post.chat_id) === String(live)
+        ? post.message_id
+        : null
+
+      // Card B posts to the LIVE telegram_chat_id — postReceipt's own guard
+      // drops it if the client has since been unlinked. The stamp below goes to
+      // the STORED post.chat_id, where the message physically lives.
+      await postReceipt(out.client, [entry], balance, null, out.orig,
+                        { postId: out.postId, replyTo })
+      if (log.stampable(post)) await log.stamp(post.id)
+    } catch (err) {
+      console.warn('[receipt] correction:', err?.message ?? err)
+    }
+  }
 }
 
 export { MAX_QTY, MAX_MONEY, MAX_BATCH, KINDS }

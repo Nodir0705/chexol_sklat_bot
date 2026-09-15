@@ -204,6 +204,47 @@ export function tashkentStamp(at) {
          ` ${p(t.getUTCHours())}:${p(t.getUTCMinutes())}`
 }
 
+// ─── Correction ink ────────────────────────────────────────────────────────────
+//
+// THE ADDITIVE RULE, identical to the picture's: a posted receipt is a DATED
+// DOCUMENT. A correction ADDS ink and nothing else — no figure the message ever
+// printed is recomputed, moved or removed. `Jami:`, the stamp and balanceLine()
+// say what the document said when it was issued; only the cancelled rows gain a
+// strike and one header line is prepended above the existing header.
+//
+// Both entry points take the ink through `opts`, and both are byte-identical to
+// their pre-correction output when it is absent — which is what lets the same
+// function render a card and, months later, re-render that same card stamped.
+
+/** Ledger-id membership, duck-typed so any Set-like works and a missing/odd
+ *  `cancelled` degrades to "nothing is cancelled" rather than throwing inside a
+ *  fire-and-forget post. An entry with no `id` is never cancelled. */
+function isCancelled(cancelled, id) {
+  return id != null && typeof cancelled?.has === 'function' && cancelled.has(id)
+}
+
+/** Wrap a line in <s> exactly once. */
+const strike = line => `<s>${line}</s>`
+
+/**
+ * The one line a correction prepends, ABOVE the existing emoji+verb header —
+ * never replacing it. The verb still records what was originally done; the
+ * cancellation is a second fact stacked on top of it, and it leads with plain
+ * words so that a push preview stripped of every entity still reads as a
+ * cancellation.
+ *
+ *   ❌ <b>Bekor qilindi</b> · 1 qator · 15.09.2026 14:22
+ *   📦 <b>Berildi</b>
+ *   <blockquote>…
+ *
+ * Returns '' when there is no correction, so callers can interpolate it blind.
+ */
+function correctionHead(correction) {
+  if (!correction) return ''
+  const count = Math.max(1, Math.trunc(Number(correction.count) || 0))
+  return `❌ <b>Bekor qilindi</b> · ${count} qator · ${esc(correction.at ?? '')}\n`
+}
+
 /**
  * One receipt grammar for all five kinds: emoji+verb header, <blockquote> detail
  * box, one bold bottom line naming the balance. Read down a group, the messages
@@ -231,10 +272,17 @@ export function tashkentStamp(at) {
  * @param orig    for a reversal, the row being cancelled — its label and its
  *                stamp head the quote, because the message points backwards.
  *                Falls back to the reversal's own kind/stamp when absent.
+ * @param opts    { cancelled?: Set<number>, correction?: { count, at } } — the
+ *                CORRECTION INK, and nothing else. See correctionHead(): every
+ *                figure this message printed stays, in place, unchanged; a
+ *                cancelled row is struck where it already sits and one header
+ *                line is prepended. Absent or empty, the output is byte-identical
+ *                to what this function returned before corrections existed.
  */
-export function formatReceipt(entry, balance, orig = null) {
+export function formatReceipt(entry, balance, orig = null, opts = {}) {
   const e  = entry ?? {}
   const ui = KIND_UI[orig?.kind ?? e.kind] ?? KIND_UI.adjustment
+  const o  = opts ?? {}
 
   const total    = som(Math.abs(Math.trunc(Number(e.amount) || 0)))
   const hasGoods = e.category_id != null && e.qty != null
@@ -260,20 +308,30 @@ export function formatReceipt(entry, balance, orig = null) {
   } else {
     const stamp = tashkentStamp(e.created_at)
     header = `${ui.icon} <b>${ui.label}</b>`
+    // A reversal card is never a stamp target (E.isReversal forbids reversing a
+    // reversal), so the ink is applied in this branch only — the branch above is
+    // already struck and must stay byte-identical.
+    const out = isCancelled(o.cancelled, e.id)
     if (e.kind === 'adjustment') {
       // The only message carrying a sign: no verb states its direction, and the
       // sign is not hanging off an "=".
-      body = `${signed(e.amount)}${note}\n${stamp}`
+      // DECISION: for a row with no goods the signed figure IS the row's
+      // qty/total line, so that is what the strike lands on — the same mark the
+      // picture makes on the no-table payment card.
+      body = `${out ? strike(signed(e.amount)) : signed(e.amount)}${note}\n${stamp}`
     } else if (hasGoods) {
       // The product owns a full-width line so a long name wraps into itself
       // instead of shattering the arithmetic beneath it.
-      body = `${product}\n${goods}${note}\n${stamp}`
+      body = out
+        ? `${strike(product)}\n${strike(goods)}${note}\n${stamp}`
+        : `${product}\n${goods}${note}\n${stamp}`
     } else {
-      body = `${total}${note}\n${stamp}`
+      body = `${out ? strike(total) : total}${note}\n${stamp}`
     }
   }
 
-  return `${header}\n<blockquote>${body}</blockquote>\n${balanceLine(balance)}`
+  return `${correctionHead(o.correction)}${header}\n<blockquote>${body}</blockquote>\n` +
+         balanceLine(balance)
 }
 
 /**
@@ -321,12 +379,22 @@ export function formatReceipt(entry, balance, orig = null) {
  *                 handover-only or return-only). Fewer than two delegates to
  *                 formatReceipt, so a one-row list is unreachable from here.
  * @param balance  the client's balance AFTER the whole batch, signed.
- * @param opts     { note, at } — the batch's own note and stamp. Both default to
- *                 the first row's, which is what the batch routes write.
+ * @param opts     { note, at, cancelled?, correction? } — the batch's own note
+ *                 and stamp (both default to the first row's, which is what the
+ *                 batch routes write), plus the correction ink: `cancelled` is a
+ *                 Set of ledger ids whose two lines are struck in place, and
+ *                 `correction` prepends one header line. `Jami:`, the stamp and
+ *                 the balance line are NEVER recomputed and never struck.
  */
 export function formatBatchReceipt(entries, balance, opts = {}) {
   const list = Array.isArray(entries) ? entries.filter(Boolean) : []
-  if (list.length < 2) return formatReceipt(list[0] ?? null, balance)
+  // The ink travels with the delegation: a batch that merged down to one row is
+  // still a stampable card. Passing only the two ink fields keeps `note`/`at`
+  // out of formatReceipt, which does not take them.
+  if (list.length < 2) {
+    return formatReceipt(list[0] ?? null, balance, null,
+      { cancelled: opts?.cancelled, correction: opts?.correction })
+  }
 
   const o  = opts ?? {}
   // A batch is goods only; the fallback exists so an unknown kind still renders a
@@ -340,9 +408,19 @@ export function formatBatchReceipt(entries, balance, opts = {}) {
     // the verb in the header carries the direction. The bottom line is where the
     // client sees the debt drop.
     const amount = Math.abs(Math.trunc(Number(e.amount) || 0))
+    // The row is summed into `grand` whether it was cancelled or not: JAMI is
+    // what this document said when it was issued. The strike below is the only
+    // difference a cancellation makes to this list.
     grand += amount
-    rows.push(esc(productLabel(e.category_name, e.parent_name) || '?'))
-    rows.push(`${e.qty} dona · ${money(amount)}`)
+    const label = esc(productLabel(e.category_name, e.parent_name) || '?')
+    const figs  = `${e.qty} dona · ${money(amount)}`
+    if (isCancelled(o.cancelled, e.id)) {
+      rows.push(strike(label))
+      rows.push(strike(figs))
+    } else {
+      rows.push(label)
+      rows.push(figs)
+    }
   }
 
   const note  = noteLine(o.note !== undefined ? o.note : list[0].note)
@@ -351,16 +429,24 @@ export function formatBatchReceipt(entries, balance, opts = {}) {
   // The note sits in the same slot as in the single receipt — after the money,
   // before the stamp — so the timestamp stays the last line inside the quote.
   const body = `${rows.join('\n')}\n${RULE}\nJami: ${som(grand)}${note}\n${stamp}`
-  return `${ui.icon} <b>${ui.label}</b>\n<blockquote>${body}</blockquote>\n${balanceLine(balance)}`
+  return `${correctionHead(o.correction)}${ui.icon} <b>${ui.label}</b>\n` +
+         `<blockquote>${body}</blockquote>\n${balanceLine(balance)}`
 }
 
 // ─── Posting ───────────────────────────────────────────────────────────────────
 
 /**
- * Build the poster. `notify(chatId, text)` resolves to:
+ * Build the poster. `notify(chatId, text, { replyTo })` resolves to:
  *   { ok: true, messageId }        — delivered
  *   { ok: false, skipped: true }   — client has no linked group
  *   { ok: false, error }           — anything else; already logged, never thrown
+ *
+ * Two methods hang off it, documented at their definitions:
+ *   notify.receipt(chatId, { svg, caption, text, followUp, replyTo })
+ *     — picture first, degrading to the text receipt on any render or upload
+ *       failure. `photo: true` comes back ONLY from the picture path.
+ *   notify.edit(chatId, messageId, { isPhoto, svg, caption, text })
+ *     — re-post in place, with a permanent/transient verdict.
  */
 /** Rasterise an SVG receipt to PNG. Kept behind a lazy import so a renderer
  *  fault can never stop the server booting -- the ledger write matters more
@@ -388,16 +474,32 @@ async function renderPng(svg) {
   }).render().asPng()
 }
 
+/**
+ * Telegram's reply_parameters for a threaded post — or null when there is
+ * nothing to thread under.
+ *
+ * allow_sending_without_reply IS NOT OPTIONAL. A correction card is the one
+ * message in this system that must arrive whatever else has failed, and without
+ * this flag Telegram REJECTS THE SEND OUTRIGHT when the message being replied to
+ * has been deleted — turning a missing thread line into a missing receipt. With
+ * it, a dead parent costs the arrow and nothing else.
+ */
+function replyParams(replyTo) {
+  if (replyTo === null || replyTo === undefined || replyTo === '') return null
+  return { message_id: Number(replyTo), allow_sending_without_reply: true }
+}
+
 export function makeNotifier(botToken) {
   const token = typeof botToken === 'string' ? botToken.trim() : ''
   if (!token) console.warn('[notify] BOT_TOKEN missing — receipts will not be posted')
 
-  async function notify(chatId, text) {
+  async function notify(chatId, text, { replyTo = null } = {}) {
     if (chatId === null || chatId === undefined || chatId === '') {
       return { ok: false, skipped: true }
     }
     if (!token) return { ok: false, error: 'no_token' }
 
+    const reply = replyParams(replyTo)
     try {
       const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
         method: 'POST',
@@ -407,6 +509,9 @@ export function makeNotifier(botToken) {
           text: String(text ?? ''),
           parse_mode: 'HTML',
           disable_web_page_preview: true,
+          // Omitted entirely when there is no parent, so every existing
+          // two-argument caller sends exactly the body it sends today.
+          ...(reply ? { reply_parameters: reply } : {}),
         }),
         signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
       })
@@ -434,12 +539,15 @@ export function makeNotifier(botToken) {
    *  Falls back to the text receipt on ANY rendering or upload failure. A
    *  picture is a nicety; the client being told what they received is not.
    */
-  notify.receipt = async function sendReceipt(chatId, { svg, caption, text, followUp = null }) {
+  notify.receipt = async function sendReceipt(
+    chatId, { svg, caption, text, followUp = null, replyTo = null }
+  ) {
     if (chatId === null || chatId === undefined || chatId === '') {
       return { ok: false, skipped: true }
     }
     if (!token) return { ok: false, error: 'no_token' }
 
+    const reply = replyParams(replyTo)
     try {
       const png = await renderPng(svg)
       const form = new FormData()
@@ -450,6 +558,9 @@ export function makeNotifier(botToken) {
       }
       form.append('caption', String(caption ?? '').slice(0, 1024))
       form.append('parse_mode', 'HTML')
+      // multipart carries no JSON types: Telegram reads this field as a JSON
+      // STRING, like every other object parameter in a FormData request.
+      if (reply) form.append('reply_parameters', JSON.stringify(reply))
       const res = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
         method: 'POST', body: form, signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS * 3),
       })
@@ -459,7 +570,145 @@ export function makeNotifier(botToken) {
       return { ok: true, messageId: json.result?.message_id, photo: true }
     } catch (err) {
       console.warn(`[notify] chat ${chatId}: photo failed (${err?.message ?? err}) — sending text`)
-      return notify(chatId, text)
+      // THE THREAD SURVIVES THE DEGRADE. If only the photo path carried replyTo,
+      // a render fault would silently unthread the correction card — the reader
+      // would get the text of the correction with no arrow back to the receipt
+      // it corrects, which is the one link the whole design rests on.
+      //
+      // The return shape stays ASYMMETRIC on purpose: { ok, messageId, photo:true }
+      // here, and notify()'s { ok, messageId } with NO photo field below. A caller
+      // reads `res.photo === true` to choose editMessageMedia over editMessageText;
+      // adding photo:false would not "tidy" that up, it would only invite someone
+      // to read the field as present-and-meaningful on a text message.
+      return notify(chatId, text, { replyTo })
+    }
+  }
+
+  const EDIT_PERMANENT = [
+    'message to edit not found',
+    'message_id_invalid',
+    "message can't be edited",
+    'message to be edited not found',
+    'chat not found',
+    'bot was kicked',
+    'bot was blocked',
+    'not enough rights',
+    'chat_write_forbidden',
+    'bot is not a member',
+  ]
+
+  /** Re-post a receipt IN PLACE: the correction stamp on an already-delivered
+   *  card. Never throws, never retries — one attempt, one classified answer, and
+   *  the caller decides. Same house rule as everything else here: a notification
+   *  failure can never reach a ledger write or an API response.
+   *
+   *    { ok: true }                              — edited, or already says this
+   *    { ok: false, permanent: true, error }     — this message can never be
+   *                                                edited again: deleted, chat
+   *                                                left, rights lost. STOP.
+   *    { ok: false, error, retryAfter? }         — transient: network, 5xx, 429,
+   *                                                a render fault. Try later.
+   *
+   *  PERMANENT vs TRANSIENT IS THE WHOLE POINT OF THE RETURN SHAPE. A permanent
+   *  answer that is read as transient retries forever against a message that no
+   *  longer exists; a transient answer recorded as final abandons a live card
+   *  over a five-second network blip. Only a Telegram `description` can earn
+   *  `permanent` — every LOCAL fault (no token, render throw, non-JSON proxy
+   *  page, socket error) is transient, because the next attempt may well work
+   *  and a renderer fault must never mark a live card 'gone'.
+   */
+
+  notify.edit = async function editReceipt(chatId, messageId, { isPhoto, svg, caption, text }) {
+    if (chatId === null || chatId === undefined || chatId === '') {
+      return { ok: false, skipped: true }
+    }
+    // Not permanent: a message_id we do not have is a bookkeeping gap, not a
+    // verdict from Telegram about a message that exists.
+    if (messageId === null || messageId === undefined || messageId === '') {
+      return { ok: false, error: 'no_message_id' }
+    }
+    if (!token) return { ok: false, error: 'no_token' }
+
+    try {
+      let url, init
+      if (isPhoto) {
+        // ONE call replaces the picture AND the caption, so the two can never
+        // disagree — a card showing a strike under a caption that does not
+        // mention it would be worse than either half alone. The render is inside
+        // the try: a render throw is a transient failure, not a permanent one.
+        const png = await renderPng(svg)
+        const form = new FormData()
+        form.append('chat_id', String(chatId))
+        form.append('message_id', String(messageId))
+        form.append('media', JSON.stringify({
+          type: 'photo',
+          media: 'attach://receipt',
+          caption: String(caption ?? '').slice(0, 1024),
+          parse_mode: 'HTML',
+        }))
+        form.append('receipt', new Blob([png], { type: 'image/png' }), 'receipt.png')
+        url  = `https://api.telegram.org/bot${token}/editMessageMedia`
+        init = { method: 'POST', body: form,
+                 signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS * 3) }
+      } else {
+        url  = `https://api.telegram.org/bot${token}/editMessageText`
+        init = {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            message_id: messageId,
+            text: String(text ?? ''),
+            parse_mode: 'HTML',
+            disable_web_page_preview: true,
+          }),
+          signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
+        }
+      }
+
+      const res = await fetch(url, init)
+      // A proxy error page is not JSON, so this parse is inside the try too —
+      // and lands in the transient catch below, which is where an HTML 502
+      // belongs.
+      const json = await res.json()
+      if (json && json.ok === true) return { ok: true }
+
+      const error = json?.description ?? `http_${res.status}`
+      const d = String(error).toLowerCase()
+
+      // SUCCESS-EQUIVALENT. The message already says exactly this, which is the
+      // state the caller wanted; reporting failure here would make it stamp
+      // forever, and reporting PERMANENT would mark a live card 'gone' and cost
+      // it every later correction. It can only ever fire on the text path:
+      // editMessageMedia with attach:// uploads a fresh PNG every time, so
+      // Telegram can never call it a no-op. (Which is why the caller's own
+      // stamped_ids is the only idempotence guard on the photo path.)
+      if (d.includes('message is not modified')) return { ok: true }
+
+      if (EDIT_PERMANENT.some(p => d.includes(p))) {
+        console.warn(`[notify] edit ${chatId}/${messageId}: ${error} (permanent)`)
+        return { ok: false, permanent: true, error }
+      }
+
+      // 429. retry_after is Telegram's own instruction; it is passed up rather
+      // than slept on here, because this function makes exactly one attempt.
+      const retryAfter = json?.parameters?.retry_after
+      if (retryAfter != null || json?.error_code === 429 || res.status === 429) {
+        console.warn(`[notify] edit ${chatId}/${messageId}: ${error} (rate)`)
+        return retryAfter != null
+          ? { ok: false, error, retryAfter }
+          : { ok: false, error }
+      }
+
+      console.warn(`[notify] edit ${chatId}/${messageId}: ${error}`)
+      return { ok: false, error }
+    } catch (err) {
+      // Timeout, socket, non-JSON body, or a throw out of renderPng. All
+      // transient by construction: nothing here is Telegram telling us the
+      // message cannot be edited.
+      const error = err?.name === 'TimeoutError' ? 'timeout' : String(err?.message ?? err)
+      console.warn(`[notify] edit ${chatId}/${messageId}: ${error}`)
+      return { ok: false, error }
     }
   }
 

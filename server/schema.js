@@ -92,4 +92,58 @@ export function migrate(db) {
     )
   `)
   db.exec('CREATE INDEX IF NOT EXISTS ix_group_link_codes_chat_id ON group_link_codes (chat_id)')
+
+  // ─── Receipt posts (DISPLAY BOOKKEEPING — outside the ledger) ───────────────
+  //
+  // A correction must EDIT the receipt it corrects, and editMessageMedia needs
+  // chat_id + message_id. These two tables are the only place that mapping
+  // lives. They are display state, not money: no column here feeds SUM(amount),
+  // no route computes a balance from them, and DROP TABLE on both leaves every
+  // balance in the system bit-for-bit identical. That is how "the ledger stays
+  // append-only" is satisfied by construction rather than by discipline.
+  //
+  // Node-only, with no mirror in database/models.py. That is the one deliberate
+  // exception to this file's Python-parity contract: only the Node server posts
+  // receipts, and SQLAlchemy's create_all ignores tables it has no model for, so
+  // whichever process wins the create race the other still agrees on everything
+  // it knows about. (group_link_codes is the same exception in reverse — declared
+  // here, owned by handlers/groups.py.)
+  //
+  // ONE MOVEMENT WRITES MANY ROWS AND POSTS ONE MESSAGE, so the row→message
+  // mapping is a join table. A message_id column on client_ledger would have to
+  // be repeated across 50 rows AND would put display state inside the
+  // append-only table.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS receipt_posts (
+      id          INTEGER NOT NULL,
+      client_id   INTEGER NOT NULL,
+      chat_id     BIGINT  NOT NULL,
+      kind        VARCHAR NOT NULL,
+      message_id  BIGINT,
+      is_photo    INTEGER NOT NULL DEFAULT 0,
+      state       VARCHAR NOT NULL DEFAULT 'pending',
+      snapshot    VARCHAR,
+      caption     VARCHAR,
+      stamped_ids VARCHAR,
+      stamped_at  DATETIME,
+      last_error  VARCHAR,
+      created_at  DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
+      PRIMARY KEY (id),
+      FOREIGN KEY(client_id) REFERENCES clients (id)
+    )
+  `)
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS receipt_post_rows (
+      ledger_id INTEGER NOT NULL,
+      post_id   INTEGER NOT NULL,
+      ord       INTEGER NOT NULL,
+      PRIMARY KEY (ledger_id),
+      FOREIGN KEY(ledger_id) REFERENCES client_ledger (id),
+      FOREIGN KEY(post_id)   REFERENCES receipt_posts (id)
+    )
+  `)
+
+  db.exec('CREATE INDEX IF NOT EXISTS ix_receipt_post_rows_post_id ON receipt_post_rows (post_id)')
+  db.exec('CREATE INDEX IF NOT EXISTS ix_receipt_posts_client_id ON receipt_posts (client_id, id)')
 }

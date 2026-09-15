@@ -182,7 +182,7 @@ const G = {
   L: 16, R: 344,
   X_NUM: 29, X_NAME: 38, COL_N: 34,
   BAND: 40, META: 48, REF: 16, HEAD: 15, ROW: 20, TOTAL: 24,
-  PAY: 52, PERF: 8, STUB: 74,
+  PAY: 52, PERF: 8, STUB: 74, CORR: 22,
   MIN_ROWS: 3, ASPECT_MAX: 1.40, MIN_NAME: 132,
   META_NAME_R: 206, META_DATE_L: 214,
 }
@@ -201,6 +201,9 @@ export function receiptSvg(r) {
   const items = (Array.isArray(r.items) ? r.items : []).map(i => ({
     label: cleanLabel(i.label), qty: Math.trunc(i.qty) || 0,
     amount: Math.abs(Math.trunc(i.amount) || 0), unit: Math.abs(Math.trunc(i.unit_price ?? 0)),
+    // The stamp flag rides along; i.id is deliberately NOT carried — clients.js
+    // maps a cancelled ledger row to its item, the renderer never needs an id.
+    cancelled: i.cancelled === true,
   }))
   const hasTable = items.length > 0
   const grand = Math.abs(Math.trunc(r.total ?? items.reduce((a, i) => a + i.amount, 0)))
@@ -228,6 +231,14 @@ export function receiptSvg(r) {
   const refH = r.kind === 'reversal' && r.orig ? G.REF : 0
   // FIXED is everything that is not a row, and the slot count is DERIVED from it,
   // so no content term can ever be forgotten out of the height formula.
+  //
+  // `fixed` is DELIBERATELY THE STAMPLESS HEIGHT. The correction bar and the
+  // "shundan bekor" sub-row are added to the y-stack BELOW, never here, because
+  // slotCap is derived from `fixed`: counting the 22pt bar in would drop slotCap
+  // from 14 to 13 on a plain batch and silently push a named product row into the
+  // "+N mahsulot" aggregate — the edit meant to protect the card would delete a
+  // line from it. A stamped card may be TALLER than the original and may exceed
+  // G.ASPECT_MAX. It may never show FEWER named rows than the original showed.
   const fixed = G.EDGE + G.BAND + G.META + refH + G.HEAD + G.TOTAL + noteH + G.PERF + G.STUB + G.EDGE
   const slotCap = Math.max(G.MIN_ROWS, Math.floor((G.ASPECT_MAX * G.W - fixed) / G.ROW))
   const overflow = hasTable && items.length > slotCap
@@ -276,9 +287,15 @@ export function receiptSvg(r) {
   const yRef   = yMeta + G.META
   const yTable = yRef + refH
   const yRows  = yTable + G.HEAD
-  const yTotal = yRows + slots * G.ROW
-  const tableH = hasTable ? G.HEAD + slots * G.ROW + G.TOTAL : G.PAY
-  const yNote  = yTable + tableH
+  // The two stamp terms. Both are 0 when r.correction is null, which is what makes
+  // this whole file a strict no-op for every card issued before the stamp existed.
+  const corrH  = r.correction ? G.CORR : 0
+  const restCancelled = rest.filter(i => i.cancelled)          // overflow remainder
+  const aggCancelH = (r.correction && overflow && restCancelled.length) ? G.ROW : 0
+  const yTotal = yRows + slots * G.ROW + aggCancelH
+  const tableH = hasTable ? G.HEAD + slots * G.ROW + aggCancelH + G.TOTAL : G.PAY
+  const yCorr  = yTable + tableH
+  const yNote  = yCorr + corrH
   const yPerf  = yNote + noteH
   const py     = yPerf + G.PERF            // the tear line AND the top of the stub
   const H      = py + G.STUB + G.EDGE
@@ -356,11 +373,16 @@ export function receiptSvg(r) {
       if (i < shown.length) {
         const it = shown[i]
         const q = form === 'A' ? `${it.qty} × ${money(it.unit)}` : String(it.qty)
+        // A cancelled row keeps its figures, its size and its place. Only the ink
+        // fades and the strike lands on top. `it.cancelled ||` is ADDED to the kind
+        // test rather than replacing it, so the standalone reversal card (card B)
+        // stays byte-identical to what it prints today.
+        const ci = it.cancelled ? C.faint : C.ink
         push(text(G.X_NUM, base, String(i + 1), { size: 8.5, fill: C.faint, anchor: 'end' }))
-        push(text(G.X_NAME, base, fitLabel(it.label, nameBudget, cell), { size: cell }))
+        push(text(G.X_NAME, base, fitLabel(it.label, nameBudget, cell), { size: cell, fill: ci }))
         push(text(xQty, base, q, { size: fitSize(q, xQty - colQ - 4, qtyS), fill: C.faint, anchor: 'end' }))
-        push(text(xSum, base, money(it.amount), { size: fitSize(money(it.amount), xSum - colS - 4, cell, 'b'), w: 'b', anchor: 'end' }))
-        if (r.kind === 'reversal') push(hline(G.X_NAME - 3, base - 3.5, xSum + 2, C.ink, 0.9))
+        push(text(xSum, base, money(it.amount), { size: fitSize(money(it.amount), xSum - colS - 4, cell, 'b'), w: 'b', fill: ci, anchor: 'end' }))
+        if (it.cancelled || r.kind === 'reversal') push(hline(G.X_NAME - 3, base - 3.5, xSum + 2, C.ink, 0.9))
       } else if (overflow && i === slots - 1) {
         // The remainder as ONE aggregate row. JAMI below stays the true total of
         // every item, so no figure on the page is a subset of the truth.
@@ -376,6 +398,22 @@ export function receiptSvg(r) {
     if (used < slots) {
       const t0 = yRows + used * G.ROW, t1 = yRows + slots * G.ROW
       push(`<path d="M${N(G.L + 3)} ${N(t1 - 3)}L${N(G.R - 3)} ${N(t0 + 3)}" stroke="${C.rule}" stroke-width="0.8"/>`)
+    }
+    // Cancelled money that fell inside the overflow aggregate gets its OWN row
+    // beneath it. The aggregate above is NOT recomputed — it keeps saying exactly
+    // what it printed, because printed figures do not move — and no named row is
+    // evicted to make space, because this row is added below the last slot and
+    // pushes JAMI down instead. Both figures use the same fitSize budgets the
+    // aggregate row already uses, so the column planner needs no new terms.
+    if (aggCancelH) {
+      const top = yRows + slots * G.ROW, base = top + 13.5
+      push(hline(G.L, top, G.R, C.rule, 0.5))
+      const cq = `${restCancelled.reduce((a, x) => a + x.qty, 0)} dona`
+      const cs = money(restCancelled.reduce((a, x) => a + x.amount, 0))
+      push(text(G.X_NAME, base, `shundan bekor: ${restCancelled.length}`, { size: cell, fill: C.faint }))
+      push(text(xQty, base, cq, { size: fitSize(cq, xQty - colQ - 4, qtyS), fill: C.faint, anchor: 'end' }))
+      push(text(xSum, base, cs, { size: fitSize(cs, xSum - colS - 4, cell, 'b'), w: 'b', fill: C.faint, anchor: 'end' }))
+      push(hline(G.X_NAME - 3, base - 3.5, xSum + 2, C.ink, 0.9))
     }
     push(rect(G.L + 0.6, yTotal, G.R - G.L - 1.2, G.TOTAL, C.panel))
     push(hline(G.L, yTotal, G.R, C.ink, 1))
@@ -396,7 +434,38 @@ export function receiptSvg(r) {
     const figS = fitSize(fig, G.R - 4 - G.X_NAME - 8, 20, 'b', 12)
     push(text(G.R - 4, yTable + 38, fig, { size: figS, w: 'b', anchor: 'end' }))
     // A cancelled figure is struck, exactly as notify.js wraps it in <s>.
-    if (r.kind === 'reversal') push(hline(G.R - 4 - W(fig, figS, 'b') - 2, yTable + 38 - figS * 0.33, G.R - 2, C.ink, 1.1))
+    if (r.kind === 'reversal' || r.correction?.all) push(hline(G.R - 4 - W(fig, figS, 'b') - 2, yTable + 38 - figS * 0.33, G.R - 2, C.ink, 1.1))
+  }
+
+  // ── 3c. the correction bar ────────────────────────────────────────────────
+  // A clerk's stamp on a finished docket: full width, directly under the table
+  // (or under the no-table JAMI box, identically), above the note. Putting it
+  // BELOW is what keeps every table row at the y it already had.
+  //
+  // It says a WORD, a COUNT and a DATE. No money, no restated total, no new
+  // balance: there is no expression in the corrected render that computes a
+  // total, a delta or a balance differently from the original render. The
+  // pointer sentence ("look at the newer receipt") lives in the caption, which
+  // is the layer a reader can tap, search and have read aloud.
+  //
+  // The ink is C.ink, NEVER C.up. In this palette C.up means "the debt ROSE" and
+  // is already the band colour of the handover being stamped; reusing it as
+  // cancellation ink would collide on the exact card where it matters most.
+  // When every row is cancelled the box is FILLED and both texts reverse out, so
+  // a wholly void card reads void at thumbnail size — a plain filled rectangle,
+  // not a rotated diagonal whose width would have to be measured and could overrun.
+  if (r.correction) {
+    const allVoid = r.correction.all === true
+    const bTop = yCorr + 3, bH = 16
+    push(`<rect x="${N(G.L)}" y="${N(bTop)}" width="${N(G.R - G.L)}" height="${bH}" fill="${allVoid ? C.ink : C.panel}" stroke="${C.ink}" stroke-width="1.1"/>`)
+    const cb = capMid(bTop, bH, 9.5)
+    const lab = 'BEKOR QILINDI'
+    push(text(G.L + 6, cb, lab, { size: 9.5, w: 'b', fill: allVoid ? C.paper : C.ink, ls: 1.2 }))
+    const cnt = `${Math.abs(Math.trunc(r.correction.count) || 0)} ta qator \u00B7 ${cleanText(r.correction.at)}`
+    // Stepped down, never truncated, against what the label leaves: the date is a
+    // caller's string and a long one must not collide with the stamp word.
+    const cntS = fitSize(cnt, (G.R - 6) - (G.L + 6 + W(lab, 9.5, 'b', 1.2) + 10), 8.5, 'r', 6.5)
+    push(tracked(G.R - 6, cb, cnt, { size: cntS, fill: allVoid ? C.paper : C.faint }))
   }
 
   // ── 4. the owner's note ───────────────────────────────────────────────────
