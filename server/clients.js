@@ -41,6 +41,11 @@ const E = {
   tooManyItems:   `bir vaqtda ko'pi bilan ${MAX_BATCH} ta mahsulot yuborish mumkin`,
 }
 
+// Receipts post as text. The rendered picture is kept behind this flag: the
+// owner found the image harder to correct than a message, and text stays
+// searchable, copyable and cheap to edit. Set RECEIPT_IMAGES=1 to post pictures.
+const RECEIPT_IMAGES = process.env.RECEIPT_IMAGES === '1'
+
 export default async function clientRoutes(app, { db, requireAuth, requireRead, notify } = {}) {
   // ─── Schema ─────────────────────────────────────────────────────────────────
   // Owned by server/schema.js, which index.js runs before registering this
@@ -283,32 +288,28 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
     if (typeof notify !== 'function') return
     if (!client || client.telegram_chat_id == null) return
     try {
-      const data = receiptData(client, entries, balance, note, orig)
       const text = entries.length === 1
         ? formatReceipt(entries[0], balance, orig)
         : formatBatchReceipt(entries, balance, { note })
-      // BOTH of these return a wrapper, not a bare value:
-      //   receiptSvg     -> { svg, width, height, ... }
-      //   receiptCaption -> { text, dropped, len, needsTextFollowUp }
-      // Sending the wrapper put a literal "[object Object]" under a receipt.
-      const card = receiptSvg(data)
-      // ONE line, deliberately NOT the item list -- the picture already carries
-      // that, and repeating it under the image reads as the message sent twice.
-      // What survives is what a picture cannot do: appear in a push notification
-      // (a photo alone previews as "Photo"), be found by search, and be read
-      // aloud. Direction, movement, balance -- nothing else.
-      const cap = { text: compactCaption(data), needsTextFollowUp: false }
-      const send = typeof notify.receipt === 'function'
-        ? notify.receipt(client.telegram_chat_id, {
-            svg: card.svg,
-            caption: cap.text,
-            // When the caption had to drop items to fit Telegram's 1024, the
-            // full itemisation follows as text so nothing a client is charged
-            // for exists only inside a picture.
-            followUp: cap.needsTextFollowUp ? text : null,
-            text,
-          })
-        : notify(client.telegram_chat_id, text)
+
+      let send
+      if (RECEIPT_IMAGES && typeof notify.receipt === 'function') {
+        // Built only when pictures are on: receiptSvg walks the whole layout,
+        // which is real work to throw away on every text receipt.
+        // receiptSvg returns { svg, width, height, ... } -- the markup is .svg.
+        const data = receiptData(client, entries, balance, note, orig)
+        send = notify.receipt(client.telegram_chat_id, {
+          svg: receiptSvg(data).svg,
+          // One line, not the item list: the picture already carries that, and
+          // repeating it underneath reads as the message sent twice. What a
+          // caption still buys is what a picture cannot do -- appear in a push
+          // notification, be found by search, be read aloud.
+          caption: compactCaption(data),
+          text,
+        })
+      } else {
+        send = notify(client.telegram_chat_id, text)
+      }
       Promise.resolve(send).catch(() => {})
     } catch (err) {
       // Rendering blew up -- still tell the client what they received.
