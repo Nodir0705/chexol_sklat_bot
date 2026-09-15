@@ -268,11 +268,22 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
       const text = entries.length === 1
         ? formatReceipt(entries[0], balance, orig)
         : formatBatchReceipt(entries, balance, { note })
-      // receiptSvg returns { svg, width, height, ... } -- the markup is .svg
+      // BOTH of these return a wrapper, not a bare value:
+      //   receiptSvg     -> { svg, width, height, ... }
+      //   receiptCaption -> { text, dropped, len, needsTextFollowUp }
+      // Sending the wrapper put a literal "[object Object]" under a receipt.
       const card = receiptSvg(data)
+      const cap  = receiptCaption(data)
       const send = typeof notify.receipt === 'function'
-        ? notify.receipt(client.telegram_chat_id,
-            { svg: card.svg, caption: receiptCaption(data), text })
+        ? notify.receipt(client.telegram_chat_id, {
+            svg: card.svg,
+            caption: cap.text,
+            // When the caption had to drop items to fit Telegram's 1024, the
+            // full itemisation follows as text so nothing a client is charged
+            // for exists only inside a picture.
+            followUp: cap.needsTextFollowUp ? text : null,
+            text,
+          })
         : notify(client.telegram_chat_id, text)
       Promise.resolve(send).catch(() => {})
     } catch (err) {
