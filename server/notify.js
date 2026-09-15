@@ -360,11 +360,22 @@ export function formatBatchReceipt(entries, balance, opts = {}) {
  *   { ok: false, skipped: true }   — client has no linked group
  *   { ok: false, error }           — anything else; already logged, never thrown
  */
+/** Rasterise an SVG receipt to PNG. Kept behind a lazy import so a renderer
+ *  fault can never stop the server booting -- the ledger write matters more
+ *  than the picture, and notifyReceipt falls back to text on any failure. */
+async function renderPng(svg) {
+  const { Resvg } = await import('@resvg/resvg-js')
+  return new Resvg(svg, {
+    font: { loadSystemFonts: true, defaultFontFamily: 'DejaVu Sans' },
+    fitTo: { mode: 'width', value: 1080 },
+  }).render().asPng()
+}
+
 export function makeNotifier(botToken) {
   const token = typeof botToken === 'string' ? botToken.trim() : ''
   if (!token) console.warn('[notify] BOT_TOKEN missing — receipts will not be posted')
 
-  return async function notify(chatId, text) {
+  async function notify(chatId, text) {
     if (chatId === null || chatId === undefined || chatId === '') {
       return { ok: false, skipped: true }
     }
@@ -396,4 +407,40 @@ export function makeNotifier(botToken) {
       return { ok: false, error }
     }
   }
+
+  /** Post a receipt as a picture with a searchable caption.
+   *
+   *  The image carries the itemised detail; the caption carries direction,
+   *  total and balance, because a photo cannot be searched, copied or read by a
+   *  screen reader and a client may need to find this months later.
+   *
+   *  Falls back to the text receipt on ANY rendering or upload failure. A
+   *  picture is a nicety; the client being told what they received is not.
+   */
+  notify.receipt = async function sendReceipt(chatId, { svg, caption, text }) {
+    if (chatId === null || chatId === undefined || chatId === '') {
+      return { ok: false, skipped: true }
+    }
+    if (!token) return { ok: false, error: 'no_token' }
+
+    try {
+      const png = await renderPng(svg)
+      const form = new FormData()
+      form.append('chat_id', String(chatId))
+      form.append('photo', new Blob([png], { type: 'image/png' }), 'receipt.png')
+      form.append('caption', String(caption ?? '').slice(0, 1024))
+      form.append('parse_mode', 'HTML')
+      const res = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
+        method: 'POST', body: form, signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS * 3),
+      })
+      const json = await res.json()
+      if (!json || json.ok !== true) throw new Error(json?.description ?? `http_${res.status}`)
+      return { ok: true, messageId: json.result?.message_id, photo: true }
+    } catch (err) {
+      console.warn(`[notify] chat ${chatId}: photo failed (${err?.message ?? err}) — sending text`)
+      return notify(chatId, text)
+    }
+  }
+
+  return notify
 }
