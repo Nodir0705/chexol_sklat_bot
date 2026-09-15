@@ -14,7 +14,7 @@
 
 import { migrate } from './schema.js'
 import { formatReceipt, formatBatchReceipt, productLabel, tashkentStamp, KIND_UI } from './notify.js'
-import { receiptSvg, receiptCaption } from './receipt-image.js'
+import { receiptSvg } from './receipt-image.js'
 
 const MAX_QTY   = 99999          // matches the Mini App's quantity input cap
 const MAX_MONEY = 10_000_000_000 // so'm; qty*unit_price stays well under 2^53
@@ -238,6 +238,19 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
     } catch {}
   }
 
+  const somCap = n => String(Math.abs(Math.trunc(n || 0)))
+    .replace(/\B(?=(\d{3})+(?!\d))/g, '\u00A0') + '\u00A0so\'m'
+
+  function compactCaption(d) {
+    const ui = KIND_UI[d.kind] ?? KIND_UI.adjustment
+    const verb = d.orig ? 'Bekor qilindi' : ui.label
+    const icon = d.orig ? '\u274C' : ui.icon
+    const bal = d.balance < 0
+      ? `Oldindan to'lov: <b>${somCap(d.balance)}</b>`
+      : `Jami qarz: <b>${somCap(d.balance)}</b>`
+    return `${icon} <b>${verb}</b> \u00B7 ${somCap(d.total)} \u00B7 ${bal}`
+  }
+
   /** Shape a movement for the image renderer. Direction comes from the SIGNED
    *  sum, never the kind word — a reversal of a payment raises the debt while
    *  its header still reads "Bekor qilindi". */
@@ -279,7 +292,12 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
       //   receiptCaption -> { text, dropped, len, needsTextFollowUp }
       // Sending the wrapper put a literal "[object Object]" under a receipt.
       const card = receiptSvg(data)
-      const cap  = receiptCaption(data)
+      // ONE line, deliberately NOT the item list -- the picture already carries
+      // that, and repeating it under the image reads as the message sent twice.
+      // What survives is what a picture cannot do: appear in a push notification
+      // (a photo alone previews as "Photo"), be found by search, and be read
+      // aloud. Direction, movement, balance -- nothing else.
+      const cap = { text: compactCaption(data), needsTextFollowUp: false }
       const send = typeof notify.receipt === 'function'
         ? notify.receipt(client.telegram_chat_id, {
             svg: card.svg,
