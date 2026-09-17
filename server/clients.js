@@ -451,9 +451,19 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
     let snapshot = null
     try {
       snapshot = postId ? snapshotOf(client, entries, balance, note, orig) : null
-      const text = entries.length === 1
-        ? formatReceipt(entries[0], balance, orig)
-        : formatBatchReceipt(entries, balance, { note })
+      // With a living board in the group, the board already lists every movement
+      // -- so a full receipt beside it is the same information posted twice, which
+      // is what the owner saw as "it sends text". The message shrinks to ONE line.
+      //
+      // It does not disappear: editing a message notifies nobody, so without this
+      // a client would never learn a delivery happened. This line is their push
+      // notification and their searchable record; the board carries the detail.
+      const boardLive = board.isLive?.(client.id) ?? false
+      const text = boardLive
+        ? compactCaption(receiptData(client, entries, balance, note, orig))
+        : entries.length === 1
+          ? formatReceipt(entries[0], balance, orig)
+          : formatBatchReceipt(entries, balance, { note })
 
       let send
       let caption = null

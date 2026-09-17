@@ -404,7 +404,26 @@ export function makeBoard({ db, notify, buildBoard, boardImage } = {}) {
     }
   }
 
-  return { refresh }
+  /** Does this client currently have a live board carrying their ledger?
+   *
+   *  Callers use it to decide how much to say in the per-movement message: with
+   *  a board in the group, repeating every line beside it posts the same
+   *  information twice. Cheap -- one primary-key read -- and never throws, so a
+   *  bookkeeping fault degrades to the fuller message rather than to no message.
+   */
+  function isLive(clientId) {
+    try {
+      const row = s.get.get(clientId)
+      return !!(row && row.state === 'live' && row.message_id != null)
+    } catch (err) {
+      // Log rather than swallow: a silent catch here once hid a plain
+      // ReferenceError and made this read as "no board" forever.
+      console.warn(`[board] isLive(${clientId}): ${err?.message ?? err}`)
+      return false
+    }
+  }
+
+  return { refresh, isLive }
 }
 
 export default makeBoard
