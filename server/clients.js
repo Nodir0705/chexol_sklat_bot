@@ -63,7 +63,14 @@ const E = {
 //
 // The renderer, the stamp bookkeeping and the correction flow all remain and
 // all still work; RECEIPT_IMAGES=1 turns pictures back on with no other change.
-const RECEIPT_IMAGES = process.env.RECEIPT_IMAGES === '1'
+const RECEIPT_IMAGES = process.env.RECEIPT_IMAGES !== '0'
+
+// The living board -- ONE pinned message per client, edited on every movement --
+// is OFF. It works, and it is current, but it is edited in place: nothing new
+// arrives in the chat, so it reads as though the bot stopped posting. The owner
+// asked for a picture PER DELIVERY that can be corrected, which is what the
+// receipt path already does. LIVING_BOARD=1 turns it back on.
+const LIVING_BOARD = process.env.LIVING_BOARD === '1'
 
 export default async function clientRoutes(app, { db, requireAuth, requireRead, notify } = {}) {
   // ─── Schema ─────────────────────────────────────────────────────────────────
@@ -201,6 +208,7 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
 
   /** Refresh a client's board. Fire-and-forget, after the rows are committed. */
   function refreshBoard(client) {
+    if (!LIVING_BOARD) return
     if (!client || client.telegram_chat_id == null) return
     try {
       Promise.resolve(
@@ -458,7 +466,7 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
       // It does not disappear: editing a message notifies nobody, so without this
       // a client would never learn a delivery happened. This line is their push
       // notification and their searchable record; the board carries the detail.
-      const boardLive = board.isLive?.(client.id) ?? false
+      const boardLive = LIVING_BOARD && (board.isLive?.(client.id) ?? false)
       const text = boardLive
         ? compactCaption(receiptData(client, entries, balance, note, orig))
         : entries.length === 1
