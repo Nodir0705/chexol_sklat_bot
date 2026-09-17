@@ -17,6 +17,13 @@ a live one, and `boardhdr` for the day separator, the fold row and the JAMI
 total — the buttons that carry no detail and exist only because a button needs
 data.
 
+The IMAGE board (spec 2026-09-17-image-board) replaces that grid with ONE photo
+and a fixed two-button keyboard — `bed:<client_id>` for ✏️ Tahrirlash and
+`brp:<client_id>` for 📊 Hisobot. They name a CLIENT, not a movement, and they
+are answered by the same machinery on the same terms: 📊 reads the tapper's own
+account and is bound to the tapping chat exactly as a row is; ✏️ is the
+board-level twin of `edq:`/`eds:` and carries the `b_<client_id>` deep link.
+
 An `edq:` / `eds:` tap is answered by WHO TAPPED, and the gate runs on
 `callback_query.from.id` — Telegram's own field, not the client-supplied
 `callback_data` — BEFORE any url exists:
@@ -69,14 +76,25 @@ CALLBACK_HEADER = r"^boardhdr$"
 # `led:`, `boardhdr`, `approve_` and `reject_` — no pattern in bot.py can shadow
 # another, whatever order they are registered in (asserted by the shadow test).
 CALLBACK_EDIT = r"^ed[qs]:\d+$"
+# The image board's two BOARD-LEVEL buttons — the whole keyboard under the photo
+# (spec §"Editing"). They carry the CLIENT id, not a ledger id, because the photo
+# is the client's whole ledger and neither button names a row. Four-byte prefixes,
+# matching server/board-grid.js's CB_* convention, fully anchored and disjoint
+# from `led:`, `ed[qs]:`, `boardhdr`, `approve_` and `reject_`.
+CALLBACK_BOARD_EDIT = r"^bed:\d+$"
+CALLBACK_BOARD_REPORT = r"^brp:\d+$"
 
 _LED_RE = re.compile(r"^led:(\d+)$")
 # Bounded digits: an id is a SQLite rowid, and an unbounded \d+ would hand a
 # 400-digit integer to the driver's binder rather than failing to match here.
 _EDIT_RE = re.compile(r"^ed([qs]):(\d{1,18})$")
+_BOARD_EDIT_RE = re.compile(r"^bed:(\d{1,18})$")
+_BOARD_REPORT_RE = re.compile(r"^brp:(\d{1,18})$")
 # The /start deep-link payload — (client_id, entry_id, field), 11 characters for
 # real ids. Same bound, same reason.
 _START_EDIT_RE = re.compile(r"^e_(\d{1,18})_(\d{1,18})_([qs])$")
+# The board button's payload: one client, no row. Same bound, same reason.
+_START_BOARD_RE = re.compile(r"^b_(\d{1,18})$")
 
 # The one live prompt in an operator's private chat. `user_data` is in-memory
 # and per-user: losing it on a restart costs one stale message and nothing else.
@@ -88,6 +106,9 @@ ANSWER_MAX = 200
 # A category name is owner-entered and unbounded. Trimmed before assembly so the
 # figures — the part a dispute turns on — are never the thing that gets cut.
 PRODUCT_MAX = 64
+# A client name is owner-entered too, and the account toast spends the rest of
+# its 200 on five figures. Same rule: the name yields, the money never does.
+CLIENT_MAX = 24
 
 # Telegram invalidates a callback query after ~15s. The ledger read is a primary
 # key lookup, but database/db.py sets busy_timeout=5000, so a WAL writer could
@@ -126,6 +147,18 @@ MSG_EDIT_NO_QTY = "Bu qatorda dona yo'q — faqat summani tuzatish mumkin."
 # Editing is silently unavailable bot-wide; the Mini App still works.
 MSG_EDIT_OFF = "Tahrirlash hozir ishlamayapti. Mini App orqali tuzating."
 
+# The board-level buttons answer about an ACCOUNT, not a row, so they need their
+# own "no such thing" — said the same way, revealing the same nothing.
+MSG_ACCOUNT_NOT_FOUND = "Bu hisob topilmadi."
+MSG_ACCOUNT_FORBIDDEN = "Bu hisob bu guruhga tegishli emas."
+MSG_NO_MOVEMENT = "Bu oy harakat bo'lmadi."
+
+# The month's name, and the four bucket labels — the same words and the same
+# spelling server/statement.js prints on the monthly Hisobot workbook, because a
+# client reads the toast and the spreadsheet as one document.
+UZ_MONTHS = ("yanvar", "fevral", "mart", "aprel", "may", "iyun",
+             "iyul", "avgust", "sentabr", "oktabr", "noyabr", "dekabr")
+
 # Who may read a row outside the client's own group: the same operator list
 # /ulash uses. `users.status='approved'` is deliberately NOT consulted — it
 # would cost a second query inside a 15-second window, and an operator reading
@@ -160,6 +193,62 @@ SELECT l.id, l.client_id, l.kind, l.category_id, l.qty, l.unit_price,
   LEFT JOIN clients cl           ON cl.id = l.client_id
   LEFT JOIN client_ledger o      ON o.id  = l.reverses_id
  WHERE l.id = :id
+"""
+
+# ─── The account query (the two board-level buttons) ───────────────────────────
+#
+# One round trip for everything both board buttons can ever need: the chat
+# binding, the name, the all-time balance and this month's four buckets.
+#
+# THE MONTH RULE IS PORTED FROM server/statement.js monthSlice(), not invented
+# here, because the same client reads this toast and the monthly Hisobot
+# workbook and they must agree to the so'm:
+#
+#   * the window is Tashkent wall-clock, half-open:
+#     `datetime(created_at,'+5 hours') >= :m_start AND < :m_next`. Shifting the
+#     COLUMN rather than the bounds also normalises whatever the writer stored
+#     ('T', a trailing 'Z', fractional seconds), which raw string comparison
+#     would not.
+#   * a row is bucketed by `COALESCE(o.kind, l.kind)` — a REVERSAL lands in the
+#     bucket of the row it cancels, whatever kind it was written with, or the
+#     buckets would not net to zero.
+#   * returns and payments are stored negative and REPORTED POSITIVE; handovers
+#     and adjustments keep their sign. Same four lines as the workbook.
+#
+# The balance is a separate scalar over the WHOLE ledger — `SUM(amount)`, the
+# one definition of a balance in this system — never derived from the buckets,
+# so the two cannot drift.
+_SELECT_CLIENT = """
+SELECT cl.id                  AS client_id,
+       cl.name                AS client_name,
+       cl.telegram_chat_id    AS client_chat_id,
+       cl.deleted_at          AS client_deleted_at,
+       (SELECT COALESCE(SUM(b.amount), 0) FROM client_ledger b
+         WHERE b.client_id = cl.id)                    AS balance,
+       COALESCE(m.given, 0)    AS given,
+       COALESCE(m.returned, 0) AS returned,
+       COALESCE(m.paid, 0)     AS paid,
+       COALESCE(m.adjusted, 0) AS adjusted
+  FROM clients cl
+  LEFT JOIN (
+        SELECT l.client_id AS client_id,
+               SUM(CASE WHEN COALESCE(o.kind, l.kind) = 'handover'
+                        THEN l.amount ELSE 0 END)  AS given,
+               SUM(CASE WHEN COALESCE(o.kind, l.kind) = 'return'
+                        THEN -l.amount ELSE 0 END) AS returned,
+               SUM(CASE WHEN COALESCE(o.kind, l.kind) = 'payment'
+                        THEN -l.amount ELSE 0 END) AS paid,
+               SUM(CASE WHEN COALESCE(o.kind, l.kind)
+                             NOT IN ('handover', 'return', 'payment')
+                        THEN l.amount ELSE 0 END)  AS adjusted
+          FROM client_ledger l
+          LEFT JOIN client_ledger o ON o.id = l.reverses_id
+         WHERE l.client_id = :id
+           AND datetime(l.created_at, '+5 hours') >= :m_start
+           AND datetime(l.created_at, '+5 hours') <  :m_next
+         GROUP BY l.client_id
+       ) m ON m.client_id = cl.id
+ WHERE cl.id = :id
 """
 
 
@@ -285,6 +374,37 @@ def _short_stamp(value):
     return _to_dt(value).astimezone(TASHKENT).strftime("%d.%m %H:%M")
 
 
+def _flow(value):
+    """A month total: magnitude, and a real minus when the total went backwards.
+
+    `_som()` alone would be a lie here. A bucket is a SUM over signed rows and a
+    reversal lands in the bucket of the row it cancels — so a handover made last
+    month and corrected this one leaves "Berildi" NEGATIVE, and printing its
+    magnitude would report goods given out that were in fact taken back.
+    """
+    try:
+        n = int(value or 0)
+    except (TypeError, ValueError):
+        n = 0
+    return f"{MINUS}{_money(n)}{NBSP}so'm" if n < 0 else _som(n)
+
+
+def month_bounds(now=None):
+    """(start, next, label) for the Tashkent month `now` falls in.
+
+    Port of monthBounds() in server/statement.js: the bounds are Tashkent
+    wall-clock strings compared against `datetime(created_at,'+5 hours')`,
+    half-open so no row is counted twice or lost, and December rolls the YEAR,
+    not the month. The label is the workbook's — "2026-yil sentabr".
+    """
+    here = (now or datetime.now(timezone.utc)).astimezone(TASHKENT)
+    year, month = here.year, here.month
+    n_year, n_month = (year + 1, 1) if month == 12 else (year, month + 1)
+    return (f"{year:04d}-{month:02d}-01 00:00:00",
+            f"{n_year:04d}-{n_month:02d}-01 00:00:00",
+            f"{year}-yil {UZ_MONTHS[month - 1]}")
+
+
 # ─── Rendering ─────────────────────────────────────────────────────────────────
 
 def _u16len(s):
@@ -379,6 +499,52 @@ def describe(row):
     return _fit([f"{icon} {verb} · {stamp}"] + body + [who]), False
 
 
+def _int(value):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def account_lines(row, month_label):
+    """One client's account as lines, most important first. Pure, never raises.
+
+    The ORDER is the design: the balance is what a dispute turns on, so it is
+    line two and the month's detail is what `_fit` trims if a client somehow
+    manages a 24-character name and nine-figure totals in all four buckets.
+
+    The balance prints its MAGNITUDE under a flipped label — exactly what
+    balanceLine() in notify.js and boardText() in board-grid.js do — because
+    "Oldindan to'lov: −160 000" prints the minus twice and reads as a broken bot.
+    """
+    name = str(row["client_name"] or "").strip()
+    if len(name) > CLIENT_MAX:
+        name = name[:CLIENT_MAX - 1].rstrip() + "…"
+    balance = _int(row["balance"])
+    label = "Jami qarz" if balance >= 0 else "Oldindan to'lov"
+    lines = [
+        f"\U0001F4CA {name}" if name else "\U0001F4CA Hisob",
+        f"{label}: {_som(balance)}",
+        f"Bu oy · {month_label}",
+    ]
+    moved = False
+    for key, word in (("given", "Berildi"), ("returned", "Qaytarildi"),
+                      ("paid", "To'landi"), ("adjusted", "Tuzatish")):
+        value = _int(row[key])
+        if value:
+            lines.append(f"{word}: {_flow(value)}")
+            moved = True
+    if not moved:
+        lines.append(MSG_NO_MOVEMENT)
+    return lines
+
+
+def describe_account(row, month_label):
+    """The account toast as (answer_text, show_alert). A toast, not an alert:
+    both board buttons are tapped on purpose and often, by the client."""
+    return _fit(account_lines(row, month_label)), False
+
+
 # ─── Authorisation ─────────────────────────────────────────────────────────────
 
 def may_see(row, chat, user):
@@ -395,6 +561,28 @@ def may_see(row, chat, user):
     The binding — clients.telegram_chat_id — is the leak guard: a row belonging
     to another client can never be described here, whatever id the callback
     carries.
+    """
+    if is_operator(user):
+        return True
+    chat_id = getattr(chat, "id", None)
+    bound = row["client_chat_id"]
+    if chat_id is None or bound is None:
+        return False
+    try:
+        return int(bound) == int(chat_id)
+    except (TypeError, ValueError):
+        return False
+
+
+def may_see_account(row, chat, user):
+    """May this tapper be told this client's balance?
+
+    The same two ways in as may_see(), and the same guard doing the work — the
+    row is bound to a chat by `clients.telegram_chat_id` and the tap must come
+    from THAT chat. Written against the client row rather than a ledger row
+    because the board-level buttons name a client, not a movement; a forged
+    `brp:<any id>` and a forwarded board both dead-end here exactly as they do
+    on the per-row path.
     """
     if is_operator(user):
         return True
@@ -453,6 +641,19 @@ async def _fetch(ledger_id):
     async with AsyncSessionLocal() as session:
         result = await session.execute(sql(_SELECT), {"id": ledger_id})
         return result.mappings().first()
+
+
+async def _fetch_account(client_id, now=None):
+    """One client's binding, balance and this month's buckets — and the label
+    for the month the figures were cut on, so the text can never name a
+    different month than the one it summed."""
+    m_start, m_next, label = month_bounds(now)
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            sql(_SELECT_CLIENT),
+            {"id": client_id, "m_start": m_start, "m_next": m_next},
+        )
+        return result.mappings().first(), label
 
 
 async def _resolve(data, chat, user):
@@ -514,6 +715,68 @@ async def _resolve_edit(data, chat, user, bot_username):
 
     # A POINTER, NOT A CAPABILITY: /start re-runs this same gate.
     url = f"https://t.me/{bot_username}?start=e_{row['client_id']}_{row['id']}_{field}"
+    return None, False, url
+
+
+async def _resolve_board_report(data, chat, user):
+    """(text, show_alert) for a `brp:<client_id>` tap. Awaited under a timeout.
+
+    THE ROW IS BOUND TO THE TAPPING CHAT, exactly as the per-row guard binds it.
+    A client tapping 📊 on their own board reads their own account — not a leak,
+    it is their money — and the binding is what keeps it that and nothing more.
+    """
+    match = _BOARD_REPORT_RE.match(str(data or ""))
+    if not match:
+        return MSG_ACCOUNT_NOT_FOUND, False
+    row, label = await _fetch_account(int(match.group(1)))
+    if row is None:
+        return MSG_ACCOUNT_NOT_FOUND, False
+    if not may_see_account(row, chat, user):
+        # Deliberately says nothing about whose account it is.
+        return MSG_ACCOUNT_FORBIDDEN, False
+    return describe_account(row, label)
+
+
+async def _resolve_board_edit(data, chat, user, bot_username):
+    """(text, show_alert, url) for a `bed:<client_id>` tap. Awaited under a timeout.
+
+    THE ORDER IS THE SECURITY, and it is the order the per-row edit path already
+    uses: the binding guard first, so the branch lives strictly inside the set of
+    accounts this tapper could already read; then the operator test on
+    `callback_query.from.id`; and only after THAT does a url exist at all.
+
+    A non-operator — the CLIENT is in this group and the button is under their
+    own photo, so they will tap it — gets the account toast, byte-identical to
+    what 📊 answers for the same account. No url, no state, and nothing that
+    says an edit affordance exists.
+    """
+    match = _BOARD_EDIT_RE.match(str(data or ""))
+    if not match:
+        return MSG_ACCOUNT_NOT_FOUND, False, None
+    row, label = await _fetch_account(int(match.group(1)))
+    if row is None:
+        return MSG_ACCOUNT_NOT_FOUND, False, None
+
+    if not may_see_account(row, chat, user):
+        return MSG_ACCOUNT_FORBIDDEN, False, None
+
+    if not is_operator(user):
+        # THE GATE.
+        text, alert = describe_account(row, label)
+        return text, alert, None
+
+    if row["client_deleted_at"] is not None:
+        # Nothing to edit: the write route refuses every row of a deleted client,
+        # so hand back the refusal here rather than a link to a sheet that cannot
+        # save. An operator is reading this, so it may speak plainly.
+        return MSG_EDIT_LOCKED, False, None
+
+    if not bot_username:
+        logger.error("bot_username missing from bot_data — edit deep links are DISABLED")
+        return MSG_EDIT_OFF, False, None
+
+    # A POINTER, NOT A CAPABILITY: /start re-runs this same gate.
+    url = f"https://t.me/{bot_username}?start=b_{row['client_id']}"
     return None, False, url
 
 
@@ -608,6 +871,64 @@ async def on_edit_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _answer(query, message, alert, url)
 
 
+async def on_board_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`brp:<client_id>` — 📊 Hisobot, the right-hand board button.
+
+    Same shape as every handler here: exactly one answer() on every path,
+    computed inside the guard, issued by the single statement after it.
+    """
+    query = update.callback_query
+    if query is None:
+        return
+
+    try:
+        message, alert = await asyncio.wait_for(
+            _resolve_board_report(query.data, update.effective_chat,
+                                  update.effective_user),
+            timeout=QUERY_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Board report %s timed out after %.1fs", query.data, QUERY_TIMEOUT_S)
+        message, alert = MSG_BUSY, False
+    except Exception as e:
+        logger.error("Board report %s failed: %s", query.data, e)
+        message, alert = MSG_BUSY, False
+
+    await _answer(query, message, alert)
+
+
+async def on_board_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`bed:<client_id>` — ✏️ Tahrirlash, the left-hand board button.
+
+    An operator is answered with a url and everyone else with a toast, and the
+    two are indistinguishable from outside: both clear the spinner, neither
+    posts anything into the group.
+    """
+    query = update.callback_query
+    if query is None:
+        return
+
+    # Read once at startup by bot.py's post_init. Absent means get_me() failed
+    # and there is no link to build; _resolve_board_edit fails closed on it.
+    bot_data = getattr(context, "bot_data", None) or {}
+    bot_username = bot_data.get("bot_username")
+
+    try:
+        message, alert, url = await asyncio.wait_for(
+            _resolve_board_edit(query.data, update.effective_chat,
+                                update.effective_user, bot_username),
+            timeout=QUERY_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Board edit %s timed out after %.1fs", query.data, QUERY_TIMEOUT_S)
+        message, alert, url = MSG_BUSY, False, None
+    except Exception as e:
+        logger.error("Board edit %s failed: %s", query.data, e)
+        message, alert, url = MSG_BUSY, False, None
+
+    await _answer(query, message, alert, url)
+
+
 # ─── The deep link (private chat only) ─────────────────────────────────────────
 
 def _is_private(chat):
@@ -686,9 +1007,21 @@ async def _edit_prompt(update, context, client_id, entry_id, field):
         # Never a web_app button that cannot open. The figures still arrive.
         logger.error("WEBAPP_URL is empty — edit prompt sent without a button")
 
-    # DELETE THEN SEND, which is what makes this idempotent: whether the client
-    # auto-sends the payload on opening an existing chat or shows a START button
-    # the operator taps, exactly ONE live prompt sits at the bottom of the chat.
+    return await _replace_prompt(context, chat, body, markup)
+
+
+async def _replace_prompt(context, chat, body, markup):
+    """DELETE THEN SEND, which is what makes a deep link idempotent: whether the
+    client auto-sends the payload on opening an existing chat or shows a START
+    button the operator taps, exactly ONE live prompt sits at the bottom of the
+    chat. Always returns True — the /start was ours, handled, whatever Telegram
+    then did with it.
+
+    ONE key for both deep links, deliberately: a row prompt and a board prompt
+    are the same object — the one live thing an operator is being asked to act
+    on — and leaving a stale one above it is how an operator edits last week's
+    row believing it is this one.
+    """
     store = getattr(context, "user_data", None)
     previous = store.get(_EDIT_PROMPT_KEY) if isinstance(store, dict) else None
     if previous:
@@ -712,6 +1045,63 @@ async def _edit_prompt(update, context, client_id, entry_id, field):
     return True
 
 
+async def _board_prompt(update, context, client_id):
+    """Send the one private prompt for a `b_<client_id>` deep link.
+
+    True if this /start is ours. False means "not handled" and the caller falls
+    through to the ORDINARY greeting — which reveals nothing: not that the id
+    exists, not which client it names, not that an edit facility exists at all.
+    """
+    chat = update.effective_chat
+    if not _is_private(chat):
+        return False
+
+    # THE GATE AGAIN, on this update's own from.id. Anyone in the group can read
+    # `bed:<id>` off the board's reply_markup and craft this link, so possession
+    # of it authorises exactly nothing.
+    if not is_operator(update.effective_user):
+        return False
+
+    try:
+        row, label = await asyncio.wait_for(
+            _fetch_account(client_id), timeout=QUERY_TIMEOUT_S
+        )
+    except Exception as e:
+        # A busy WAL writer, a binder that refused the id — either way this is
+        # not our /start. Fall through rather than answer with nothing.
+        logger.warning("Board prompt lookup failed for %s: %s", client_id, e)
+        return False
+    if row is None or row["client_deleted_at"] is not None:
+        return False
+
+    # A MESSAGE, not a callback answer: 4096 characters, so the figures are
+    # joined whole here rather than squeezed through _fit's 200.
+    # PLAIN TEXT, no parse_mode: the client name is owner-entered and may
+    # contain '<'. Nothing here needs markup.
+    body = "\n".join(["✏️ Tuzatish"] + account_lines(row, label))
+
+    markup = None
+    if WEBAPP_URL:
+        # `web_app` is used here and ONLY here: "Available only in private chats
+        # between a user and the bot." The board's keyboard lives in a GROUP,
+        # which is the whole reason this deep link exists.
+        #
+        # `?edit=<clientId>.<entryId>` is the Mini App's existing deep-link
+        # parameter. Entry 0 names no row: ClientsPage opens this client's
+        # ledger on it, and ClientDetailPage's readEditParam rejects an entryId
+        # below 1, so no edit sheet is forced open — the operator lands on the
+        # ledger and picks the row, which is what a board-level button means.
+        sheet = f"{WEBAPP_URL}?edit={client_id}.0"
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✏️ Tahrirlash", web_app=WebAppInfo(url=sheet))]]
+        )
+    else:
+        # Never a web_app button that cannot open. The figures still arrive.
+        logger.error("WEBAPP_URL is empty — board prompt sent without a button")
+
+    return await _replace_prompt(context, chat, body, markup)
+
+
 async def on_start_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/start — the edit deep link, or the ordinary greeting.
 
@@ -730,9 +1120,17 @@ async def on_start_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     args = getattr(context, "args", None) or []
-    match = _START_EDIT_RE.match(str(args[0])) if args else None
+    payload = str(args[0]) if args else ""
+
+    match = _START_EDIT_RE.match(payload)
     if match and await _edit_prompt(update, context, int(match.group(1)),
                                     int(match.group(2)), match.group(3)):
+        return
+
+    # The board button's payload. Disjoint from the row payload by its prefix,
+    # so the two branches can never both claim one /start.
+    match = _START_BOARD_RE.match(payload)
+    if match and await _board_prompt(update, context, int(match.group(1))):
         return
 
     await _ordinary_start(update, context)

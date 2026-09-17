@@ -442,11 +442,15 @@ export function formatBatchReceipt(entries, balance, opts = {}) {
  *   { ok: false, skipped: true }   — client has no linked group
  *   { ok: false, error }           — anything else; already logged, never thrown
  *
- * Two methods hang off it, documented at their definitions:
+ * Three methods hang off it, documented at their definitions:
  *   notify.receipt(chatId, { svg, caption, text, followUp, replyTo })
  *     — picture first, degrading to the text receipt on any render or upload
  *       failure. `photo: true` comes back ONLY from the picture path.
- *   notify.edit(chatId, messageId, { isPhoto, svg, caption, text })
+ *   notify.photo(chatId, { svg, caption, reply_markup })
+ *     — a picture WITH an inline keyboard, and NO text fallback of its own.
+ *       The living board's fresh post. Its caller owns the degrade, because
+ *       its caller is the one that must RECORD which form was posted.
+ *   notify.edit(chatId, messageId, { isPhoto, svg, caption, text, reply_markup })
  *     — re-post in place, with a permanent/transient verdict.
  */
 /** Rasterise an SVG receipt to PNG. Kept behind a lazy import so a renderer
@@ -587,6 +591,61 @@ export function makeNotifier(botToken) {
     }
   }
 
+  /** Post a picture that CARRIES AN INLINE KEYBOARD — the living board's fresh
+   *  post. Verified against the live API (2026-09-17): sendPhoto accepts
+   *  reply_markup, so the board's buttons arrive with the board itself and there
+   *  is no window in which a picture sits in the group without its controls.
+   *
+   *  THE ONE WAY THIS DIFFERS FROM notify.receipt: there is no text fallback in
+   *  here. A receipt degrades to text INSIDE notify.receipt because the caller
+   *  does not care which form arrived; a BOARD's caller cares absolutely, because
+   *  a photo board is edited with editMessageMedia and a text board with
+   *  editMessageText, and guessing wrong fails every subsequent edit. So this
+   *  function reports one unambiguous outcome and server/board.js chooses the
+   *  fallback AND records what it chose. Same never-throws discipline as the
+   *  rest of this file:
+   *
+   *    { ok: true, messageId, photo: true }  — delivered as a picture
+   *    { ok: false, skipped: true }          — no chat to post into
+   *    { ok: false, error }                  — render, upload, network, Telegram
+   */
+  notify.photo = async function sendBoardPhoto(chatId, { svg, caption, reply_markup = null } = {}) {
+    if (chatId === null || chatId === undefined || chatId === '') {
+      return { ok: false, skipped: true }
+    }
+    if (!token) return { ok: false, error: 'no_token' }
+
+    try {
+      // Inside the try: a renderer fault is just another reason this returns
+      // { ok: false }, and the caller's text board covers it.
+      const png = await renderPng(svg)
+      const form = new FormData()
+      form.append('chat_id', String(chatId))
+      form.append('photo', new Blob([png], { type: 'image/png' }), 'board.png')
+      form.append('caption', String(caption ?? '').slice(0, 1024))
+      form.append('parse_mode', 'HTML')
+      // multipart carries no JSON types: Telegram reads this field as a JSON
+      // STRING, exactly like reply_parameters in notify.receipt above.
+      if (reply_markup) form.append('reply_markup', JSON.stringify(reply_markup))
+      const res = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
+        method: 'POST', body: form, signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS * 3),
+      })
+      const json = await res.json()
+      if (!json || json.ok !== true) {
+        const error = json?.description ?? `http_${res.status}`
+        console.warn(`[notify] photo ${chatId}: ${error}`)
+        return { ok: false, error }
+      }
+      // `photo: true` is the same flag notify.receipt sets on the same path, and
+      // it means the same thing: this message can only ever be edited as media.
+      return { ok: true, messageId: json.result?.message_id, photo: true }
+    } catch (err) {
+      const error = err?.name === 'TimeoutError' ? 'timeout' : String(err?.message ?? err)
+      console.warn(`[notify] photo ${chatId}: ${error}`)
+      return { ok: false, error }
+    }
+  }
+
   const EDIT_PERMANENT = [
     'message to edit not found',
     'message_id_invalid',
@@ -598,6 +657,15 @@ export function makeNotifier(botToken) {
     'not enough rights',
     'chat_write_forbidden',
     'bot is not a member',
+    // THE WRONG-PATH VERDICT. editMessageText against a photo, or
+    // editMessageMedia against a text message, answers one of these — i.e. "the
+    // stored is_photo disagrees with the message that is actually up there".
+    // Retrying that forever would freeze the board at whatever it last said, so
+    // it is PERMANENT: the caller marks the message gone and posts a fresh
+    // board, which re-records the form correctly. A bookkeeping slip then costs
+    // one duplicate board, not a client who never sees their balance move again.
+    'there is no text in the message to edit',
+    'there is no media in the message to edit',
   ]
 
   /** Re-post a receipt IN PLACE: the correction stamp on an already-delivered
@@ -635,10 +703,12 @@ export function makeNotifier(botToken) {
     try {
       let url, init
       if (isPhoto) {
-        // ONE call replaces the picture AND the caption, so the two can never
-        // disagree — a card showing a strike under a caption that does not
-        // mention it would be worse than either half alone. The render is inside
-        // the try: a render throw is a transient failure, not a permanent one.
+        // ONE call replaces the picture, the caption AND the keyboard, so no two
+        // of them can ever disagree — a card showing a strike under a caption
+        // that does not mention it would be worse than either half alone, and a
+        // living board whose buttons outlive the picture they belong to is the
+        // same fault one layer out. The render is inside the try: a render throw
+        // is a transient failure, not a permanent one.
         const png = await renderPng(svg)
         const form = new FormData()
         form.append('chat_id', String(chatId))
@@ -650,6 +720,16 @@ export function makeNotifier(botToken) {
           parse_mode: 'HTML',
         }))
         form.append('receipt', new Blob([png], { type: 'image/png' }), 'receipt.png')
+        // A TOP-LEVEL field, NOT a key inside the `media` object: reply_markup is
+        // a parameter of editMessageMedia, and Telegram silently ignores unknown
+        // keys inside InputMediaPhoto — the buttons would just quietly vanish.
+        // As with `media` itself, multipart carries it as a JSON string.
+        //
+        // Omitting it REMOVES the keyboard, exactly as on the text path below, so
+        // every photo edit that wants buttons must resend them. Verified against
+        // the live API (2026-09-17): media + reply_markup in one call replaces
+        // both together.
+        if (reply_markup) form.append('reply_markup', JSON.stringify(reply_markup))
         url  = `https://api.telegram.org/bot${token}/editMessageMedia`
         init = { method: 'POST', body: form,
                  signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS * 3) }

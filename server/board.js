@@ -1,47 +1,129 @@
 // Living board — ONE growing message per client group, edited in place.
 //
-// A client's group holds exactly one board: a message whose inline keyboard is
-// the whole ledger as a grid. Every movement REBUILDS that grid from the ledger
-// rows it is handed and EDITS the message. Nothing here accumulates; there is no
-// counter, no running total, no "add one row to what is already there". That is
-// why the board's JAMI can never drift from SUM(amount): the only arithmetic in
-// the system lives in the rows the caller SELECTed, and this module is a
-// transport for them.
+// A client's group holds exactly one board: a PHOTO of the whole ledger, with a
+// caption and two buttons under it. Every movement REBUILDS that picture from the
+// ledger rows it is handed and EDITS the message. Nothing here accumulates; there
+// is no counter, no running total, no "add one row to what is already there".
+// That is why the board's JAMI can never drift from SUM(amount): the only
+// arithmetic in the system lives in the rows the caller SELECTed, and this module
+// is a transport for them.
+//
+// ─── Picture, with text as the floor ──────────────────────────────────────────
+//
+// The board is rendered TWO ways on every movement: boardImage() for the picture
+// and buildBoard() for the text board that predates it. The picture is posted
+// when it renders and uploads; the text board goes out when either fails. A
+// picture is a nicety — the client knowing their balance is not — so there is no
+// path here on which a movement leaves the group with nothing.
+//
+// WHICH FORM WENT OUT IS RECORDED (client_boards.is_photo), because it decides
+// how the NEXT movement edits: editMessageMedia for a photo, editMessageText for
+// a text message. Telegram refuses the mismatch, so an unrecorded form is not a
+// cosmetic slip, it is every later edit failing. Two consequences worth stating
+// plainly:
+//
+//   - A text board is never UPGRADED to a photo in place. editMessageMedia
+//     cannot turn a text message into a photo, so a board that fell back stays
+//     text until Telegram declares it gone and a fresh one is posted. Boards
+//     that predate this file's photo support have is_photo = 0 and behave
+//     exactly as they always did.
+//   - A LIVE PHOTO board whose picture fails to render this time is left ALONE.
+//     It cannot be edited as text, and posting a text board beside it would give
+//     the client two boards disagreeing about their debt. One movement stale is
+//     the smaller fault; the next movement is the retry.
 //
 // This module owns client_boards (client_id → chat_id, message_id, state) and
 // nothing else. It is display state, not money: no column here feeds
 // SUM(amount), no route computes a balance from it, and DROP TABLE client_boards
 // leaves every balance bit-for-bit identical — the same contract receipt_posts
-// keeps. It imports NOTHING from clients.js; `buildBoard` is injected, so the
-// dependency runs one way only.
+// keeps. It imports NOTHING from clients.js; both renderers — `buildBoard` and
+// `boardImage` — are injected, so the dependency runs one way only.
 //
 // THE STANDING RULE OF THIS SERVER, which every line below obeys: a notification
 // concern never affects the ledger write or the API response. refresh() is
 // total — it returns a promise that always resolves, and it never throws into
 // its caller.
 //
-// ── The notify contract this file assumes ──────────────────────────────────────
-// buildBoard's output is Telegram's own vocabulary and is passed through
-// VERBATIM, with no translation step that could drift:
+// ── The renderer and notify contracts this file assumes ───────────────────────
+// Both renderers are PURE — rows in, Telegram's own vocabulary out — and their
+// output is passed through VERBATIM, with no translation step that could drift:
 //
-//   built = buildBoard(rows, { clientName, balance })   → { text, reply_markup }
-//   notify(chatId, built.text, { reply_markup })        → { ok, messageId }
-//   notify.edit(chatId, messageId, built)               → { ok }
-//                                                       | { ok: false, permanent, error }
-//                                                       | { ok: false, error, retryAfter? }
+//   img   = boardImage(rows, { clientName, balance })  → { svg, width, height, caption }
+//   built = buildBoard(rows, { clientName, balance })  → { text, reply_markup }
 //
-// notify.edit takes `built` whole: `text` selects its editMessageText path and
-// `reply_markup` rides along, so the text and the grid are replaced in ONE call
-// and can never disagree.
+//   notify.photo(chatId, { svg, caption, reply_markup })   → { ok, messageId, photo }
+//                                                          | { ok: false, error }
+//   notify(chatId, built.text, { reply_markup })           → { ok, messageId }
+//   notify.edit(chatId, messageId, { isPhoto, svg, caption, reply_markup })
+//   notify.edit(chatId, messageId, built)                  → { ok }
+//                                                          | { ok: false, permanent, error }
+//                                                          | { ok: false, error, retryAfter? }
+//
+// notify.edit takes ONE object and the `isPhoto` flag in it selects the method:
+// editMessageMedia carries svg + caption + reply_markup, editMessageText carries
+// text + reply_markup. Either way the whole message is replaced in ONE call, so
+// no part of a board can ever disagree with another part of the same board.
+//
+// The picture is OPTIONAL. Without a boardImage dependency — or with one that
+// throws — every board is the text board, which is what this module did before
+// the picture existed and what it must keep doing when the picture is unavailable.
+
+// ── The keyboard ──────────────────────────────────────────────────────────────
+//
+// TWO BUTTONS, AND THEY NEVER CHANGE. That is a design constraint, not an
+// unfinished feature: an inline keyboard is SHARED STATE ON THE MESSAGE. A picker
+// "opened in place" would open on the client's phone too — the client is in this
+// group — and be tappable by them. So nothing here is ever a mode, a step or a
+// selection; both buttons are one-shot requests answered with answerCallbackQuery
+// (a toast, or a url that opens the bot privately, where per-user state is legal).
+//
+// CONTRACT WITH handlers/board.py — these two literal strings are the whole
+// interface, and the Python side must match them exactly:
+//
+//   bed:<clientId>   ✏️ Tahrirlash — operator-gated on callback_query.from.id;
+//                    an operator is answered with url = t.me/<bot>?start=b_<clientId>,
+//                    anyone else (the client included) with a plain toast that
+//                    reveals no edit affordance.
+//   brp:<clientId>   📊 Hisobot — any group member: a toast with the balance and
+//                    this month's totals. Their own account, nothing else reachable.
+//
+// The 4-byte prefix follows board-grid.js's `led:` / `edq:` / `eds:` vocabulary.
+// Telegram caps callback_data at 64 bytes; a SQLite rowid is at most 19 digits,
+// so `bed:` + id is at most 23 and cannot overflow in this universe.
+const KB_EDIT   = 'bed:'
+const KB_REPORT = 'brp:'
+
+/** The board's keyboard. Identical on the fresh post and on every edit, so the
+ *  two can never disagree about what the buttons are. */
+function boardKeyboard(clientId) {
+  return {
+    inline_keyboard: [[
+      { text: '✏️ Tahrirlash', callback_data: `${KB_EDIT}${clientId}` },
+      { text: '📊 Hisobot',    callback_data: `${KB_REPORT}${clientId}` },
+    ]],
+  }
+}
 
 /**
  * @param {object}   deps
  * @param {import('node:sqlite').DatabaseSync} deps.db
- * @param {Function} deps.notify      the notifier; needs notify.edit
+ * @param {Function} deps.notify      the notifier; needs notify.edit, and
+ *                                    notify.photo for the picture
  * @param {Function} deps.buildBoard  buildBoard(rows, { clientName, balance })
  *                                      → { text, reply_markup }
+ * @param {Function} [deps.boardImage] boardImage(rows, { clientName, balance })
+ *                                      → { svg, width, height, caption }.
+ *                                    Absent, every board is a text board.
  */
-export function makeBoard({ db, notify, buildBoard } = {}) {
+export function makeBoard({ db, notify, buildBoard, boardImage } = {}) {
+  // Which FORM the stored message took. Additive, defaulted, and applied the way
+  // every other late column in this server is (server/index.js, server/schema.js):
+  // an existing row reads 0 and is a text board, which is exactly what it is.
+  // MUST run before the prepares below — upsertLive names the column.
+  try {
+    db.exec('ALTER TABLE client_boards ADD COLUMN is_photo INTEGER NOT NULL DEFAULT 0')
+  } catch { /* already there */ }
+
   const s = {
     get: db.prepare('SELECT * FROM client_boards WHERE client_id = ?'),
 
@@ -55,13 +137,18 @@ export function makeBoard({ db, notify, buildBoard } = {}) {
     // chat_id is written from the CLIENT'S CURRENT LINK, because that is the
     // chat the message it records was just posted into. Every later EDIT reads
     // it back out of this row instead. See runRefresh().
+    //
+    // is_photo is written on EVERY fresh post, 1 or 0, never left to the column
+    // default: the row that records where the board lives must also record what
+    // it is, or the next movement edits it down the wrong method.
     upsertLive: db.prepare(`
-      INSERT INTO client_boards (client_id, chat_id, message_id, state, updated_at)
-      VALUES (?, ?, ?, 'live', CURRENT_TIMESTAMP)
+      INSERT INTO client_boards (client_id, chat_id, message_id, state, is_photo, updated_at)
+      VALUES (?, ?, ?, 'live', ?, CURRENT_TIMESTAMP)
       ON CONFLICT(client_id) DO UPDATE SET
         chat_id    = excluded.chat_id,
         message_id = excluded.message_id,
         state      = 'live',
+        is_photo   = excluded.is_photo,
         updated_at = CURRENT_TIMESTAMP
     `),
 
@@ -150,15 +237,52 @@ export function makeBoard({ db, notify, buildBoard } = {}) {
     return state.running
   }
 
+  /**
+   * The picture, or null if there is not going to be one.
+   *
+   * TOTAL, like everything else here: a renderer that throws, returns nothing,
+   * or returns something that is not a usable SVG is a MISSING PICTURE, which is
+   * a condition this module already handles, not an exception for a caller to
+   * catch. Validated here rather than at the upload, so a fresh post never
+   * spends a round trip discovering that `svg` was undefined.
+   *
+   * Deliberately independent of notify.photo: an ALREADY-LIVE photo board is
+   * edited through notify.edit and still needs a picture, so tying the render to
+   * the poster would freeze such a board the moment the poster went missing.
+   */
+  function renderImage(client, rows, balance) {
+    if (typeof boardImage !== 'function') return null
+    try {
+      const img = boardImage(rows, { clientName: client.name, balance })
+      if (!img || typeof img.svg !== 'string' || !img.svg.trim()) {
+        warn('boardImage', 'no svg'); return null
+      }
+      // The caption is the client's searchable record and their push line, but a
+      // picture with a missing caption still shows the whole ledger — so a bad
+      // caption costs the caption, not the board.
+      return { svg: img.svg, caption: typeof img.caption === 'string' ? img.caption : '' }
+    } catch (err) {
+      warn('boardImage', err)
+      return null
+    }
+  }
+
   async function runRefresh({ client, rows, balance }) {
     try {
-      // Built BEFORE anything is read or written: a renderer fault must cost a
-      // log line and leave the stored board exactly as it was, not a half-applied
-      // state change.
+      // Both renderings happen BEFORE anything is read or written: a renderer
+      // fault must cost a log line and leave the stored board exactly as it was,
+      // not a half-applied state change.
+      //
+      // The TEXT board is built unconditionally, even when the picture renders.
+      // It is the floor under every path below and it is a pure function over
+      // rows already in memory; making it conditional would trade nothing for a
+      // branch that is only exercised on the day the renderer breaks.
       const built = buildBoard(rows, { clientName: client.name, balance })
       if (!built || typeof built.text !== 'string') {
         warn('buildBoard', 'no text'); return
       }
+      const img = renderImage(client, rows, balance)
+      const keyboard = boardKeyboard(client.id)
 
       let row
       try { row = s.get.get(client.id) ?? null } catch (err) { warn('get', err); return }
@@ -184,10 +308,29 @@ export function makeBoard({ db, notify, buildBoard } = {}) {
           warn('edit', 'notify.edit unavailable'); return
         }
 
-        // ONE call carries the new text AND the new grid. Two calls
-        // (editMessageText then editMessageReplyMarkup) can half-fail and leave
-        // a header whose total disagrees with the rows underneath it.
-        const res = await notify.edit(row.chat_id, row.message_id, built)
+        // THE STORED FORM DECIDES THE METHOD. Telegram will not edit a photo
+        // message as text or a text message as media, so this flag — not what we
+        // happen to have rendered this time — is what selects the call.
+        const wasPhoto = !!row.is_photo
+
+        if (wasPhoto && !img) {
+          // A live photo board and no picture to put in it. There is no second
+          // move here: editMessageText would be refused, and posting the text
+          // board fresh would leave the client with TWO boards, the old one
+          // frozen at a stale total. Treated exactly like a transient edit
+          // failure — row untouched, next movement is the retry.
+          warn('edit', 'no image for a photo board — leaving it stale')
+          return
+        }
+
+        // ONE call carries the new picture AND its caption AND its buttons — or
+        // the new text AND its grid. Two calls (edit the content, then edit the
+        // markup) can half-fail and leave a board whose buttons or header
+        // disagree with the rows underneath them.
+        const res = wasPhoto
+          ? await notify.edit(row.chat_id, row.message_id,
+              { isPhoto: true, svg: img.svg, caption: img.caption, reply_markup: keyboard })
+          : await notify.edit(row.chat_id, row.message_id, built)
 
         // ok also covers "message is not modified" — notify.edit reports that as
         // success, which is what makes calling refresh() after EVERY movement
@@ -214,14 +357,37 @@ export function makeBoard({ db, notify, buildBoard } = {}) {
       }
 
       // No board, a board in a group this client no longer uses, or one Telegram
-      // just declared gone. Post a fresh one into the CURRENT group.
-      const sent = await notify(client.telegram_chat_id, built.text, {
-        reply_markup: built.reply_markup,
-      })
+      // just declared gone. Post a fresh one into the CURRENT group — as a
+      // PICTURE if there is one and it uploads, otherwise as the text board.
+      //
+      // THE FALLBACK IS A DEGRADE, NOT A RETRY. The one-attempt-per-movement rule
+      // is about never hammering the same failing call; this is the second FORM
+      // of the message, tried once, and it is the same shape notify.receipt has
+      // used for every receipt this server has ever sent. If both fail the row is
+      // left untouched and the next movement makes exactly one more attempt.
+      let sent = null
+      let posted = 0        // what actually went out: 1 photo, 0 text
+      if (img && typeof notify.photo === 'function') {
+        sent = await notify.photo(client.telegram_chat_id, {
+          svg: img.svg, caption: img.caption, reply_markup: keyboard,
+        })
+        if (sent?.ok && sent.messageId != null) posted = 1
+        else warn('photo', sent?.skipped ? 'skipped' : (sent?.error ?? 'send_failed'))
+      }
+
+      if (!posted) {
+        sent = await notify(client.telegram_chat_id, built.text, {
+          reply_markup: built.reply_markup,
+        })
+      }
 
       if (sent?.ok && sent.messageId != null) {
-        // Clears 'gone' and rebinds chat_id + message_id in one statement.
-        write(s.upsertLive, 'upsertLive', client.id, client.telegram_chat_id, sent.messageId)
+        // Clears 'gone' and rebinds chat_id + message_id + is_photo in one
+        // statement. is_photo is what every later edit reads to pick its method,
+        // so it is written from what was ACTUALLY posted, never from what was
+        // attempted.
+        write(s.upsertLive, 'upsertLive',
+          client.id, client.telegram_chat_id, sent.messageId, posted)
         return
       }
 
@@ -230,9 +396,10 @@ export function makeBoard({ db, notify, buildBoard } = {}) {
       // the rate movements happen at, not a loop.
       warn('post', sent?.skipped ? 'skipped' : (sent?.error ?? 'send_failed'))
     } catch (err) {
-      // A buildBoard throw, a Telegram client fault, a busy database file. The
-      // ledger row is already committed and the client's short movement line is
-      // already sent; this costs a stale grid and one log line.
+      // A renderer throw the guards above did not catch, a Telegram client
+      // fault, a busy database file. The ledger row is already committed and the
+      // client's short movement line is already sent; this costs a stale board
+      // and one log line.
       warn('runRefresh', err)
     }
   }

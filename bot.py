@@ -11,8 +11,9 @@ from handlers.groups import ulash, on_my_chat_member
 # /start — no payload, a malformed one, a non-operator, a row that may not be
 # edited — to handlers.start.start untouched.
 from handlers.board import (on_ledger_tap, on_board_header, on_edit_tap,
-                            on_start_edit, CALLBACK_LEDGER, CALLBACK_HEADER,
-                            CALLBACK_EDIT)
+                            on_board_edit, on_board_report, on_start_edit,
+                            CALLBACK_LEDGER, CALLBACK_HEADER, CALLBACK_EDIT,
+                            CALLBACK_BOARD_EDIT, CALLBACK_BOARD_REPORT)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -53,14 +54,17 @@ def main():
     application.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_handler(CallbackQueryHandler(handle_approve, pattern=r"^approve_\d+$"))
     application.add_handler(CallbackQueryHandler(handle_reject,  pattern=r"^reject_\d+$"))
-    # The living board's grid. Every pattern in this group is fully anchored
-    # (^...$) and the five prefixes are disjoint — "led:"/"edq:"/"eds:"/"boardhdr"
+    # The living board. Every pattern in this group is fully anchored (^...$) and
+    # the prefixes are disjoint — "led:"/"edq:"/"eds:"/"bed:"/"brp:"/"boardhdr"
     # can never match an approve_/reject_ payload, nor can those match ours, nor
-    # can "led:" match "edq:" — so order inside the group is irrelevant and no
-    # handler can shadow another.
+    # can any of ours match another — so order inside the group is irrelevant and
+    # no handler can shadow another (asserted programmatically by the shadow test).
     application.add_handler(CallbackQueryHandler(on_ledger_tap,   pattern=CALLBACK_LEDGER))
     application.add_handler(CallbackQueryHandler(on_board_header, pattern=CALLBACK_HEADER))
     application.add_handler(CallbackQueryHandler(on_edit_tap,     pattern=CALLBACK_EDIT))
+    # The image board's two board-level buttons: ✏️ Tahrirlash and 📊 Hisobot.
+    application.add_handler(CallbackQueryHandler(on_board_edit,   pattern=CALLBACK_BOARD_EDIT))
+    application.add_handler(CallbackQueryHandler(on_board_report, pattern=CALLBACK_BOARD_REPORT))
 
     application.run_polling()
 

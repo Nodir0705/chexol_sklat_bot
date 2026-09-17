@@ -16,6 +16,7 @@ import { migrate } from './schema.js'
 import { formatReceipt, formatBatchReceipt, productLabel, tashkentStamp, KIND_UI } from './notify.js'
 import { receiptSvg } from './receipt-image.js'
 import { makeBoard } from './board.js'
+import { boardImage } from './board-image.js'
 import { buildBoard } from './board-grid.js'
 import { makeReceiptLog } from './receipt-log.js'
 
@@ -196,7 +197,7 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
   // rather than re-posted. It is rebuilt from the ledger each time, so it cannot
   // drift from SUM(amount), and like every other notification concern here it can
   // never throw into a request or affect a ledger write.
-  const board = makeBoard({ db, notify, buildBoard })
+  const board = makeBoard({ db, notify, buildBoard, boardImage })
 
   /** Refresh a client's board. Fire-and-forget, after the rows are committed. */
   function refreshBoard(client) {
