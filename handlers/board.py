@@ -60,6 +60,17 @@ from sqlalchemy import text as sql
 
 from database.db import AsyncSessionLocal
 from config import ADMIN_ID, APPROVED_IDS, WEBAPP_URL
+
+
+def _app_url(query: str) -> str:
+    """Mini App URL with an explicit path.
+
+    WEBAPP_URL is a bare origin, so f"{WEBAPP_URL}?x=1" yields
+    "https://host?x=1" -- legal, but the missing "/" is the kind of thing a
+    URL normaliser in the middle quietly rewrites. Spell the path.
+    """
+    base = WEBAPP_URL.rstrip("/")
+    return f"{base}/?{query}"
 # The deep link's fallback: any /start this module does not claim — no payload,
 # a malformed one, a non-operator, a row that may not be edited — is handed to
 # the ordinary greeting untouched. handlers/start.py imports nothing from here,
@@ -999,7 +1010,7 @@ async def _edit_prompt(update, context, client_id, entry_id, field):
         # `web_app` is used here and ONLY here: "Available only in private chats
         # between a user and the bot." No group keyboard in this design carries
         # one — which is the whole reason the deep link exists.
-        sheet = f"{WEBAPP_URL}?edit={client_id}.{entry_id}&f={field}"
+        sheet = _app_url(f"edit={client_id}.{entry_id}&f={field}")
         markup = InlineKeyboardMarkup(
             [[InlineKeyboardButton("✏️ Tahrirlash", web_app=WebAppInfo(url=sheet))]]
         )
@@ -1091,7 +1102,7 @@ async def _board_prompt(update, context, client_id):
         # ledger on it, and ClientDetailPage's readEditParam rejects an entryId
         # below 1, so no edit sheet is forced open — the operator lands on the
         # ledger and picks the row, which is what a board-level button means.
-        sheet = f"{WEBAPP_URL}?edit={client_id}.0"
+        sheet = _app_url(f"edit={client_id}.0")
         markup = InlineKeyboardMarkup(
             [[InlineKeyboardButton("✏️ Tahrirlash", web_app=WebAppInfo(url=sheet))]]
         )
