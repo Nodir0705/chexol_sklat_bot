@@ -93,6 +93,15 @@ export function migrate(db) {
   `)
   db.exec('CREATE INDEX IF NOT EXISTS ix_group_link_codes_chat_id ON group_link_codes (chat_id)')
 
+  // `corrects_id` — provenance for POST /api/ledger/:entryId/edit. An edit is a
+  // reversal plus a re-entry, and this points the re-entry at what it replaced,
+  // so the board can draw the correction at the original's position instead of
+  // as a third unexplained row. Added here because schema.js is the one owner of
+  // DDL in this project; clients.js carries the same guarded ALTER so a server
+  // that boots before a migration still finds the column.
+  try { db.exec('ALTER TABLE client_ledger ADD COLUMN corrects_id INTEGER') } catch {}
+  db.exec('CREATE INDEX IF NOT EXISTS ix_client_ledger_corrects_id ON client_ledger (corrects_id)')
+
   // ─── Receipt posts (DISPLAY BOOKKEEPING — outside the ledger) ───────────────
   //
   // A correction must EDIT the receipt it corrects, and editMessageMedia needs
@@ -146,4 +155,51 @@ export function migrate(db) {
 
   db.exec('CREATE INDEX IF NOT EXISTS ix_receipt_post_rows_post_id ON receipt_post_rows (post_id)')
   db.exec('CREATE INDEX IF NOT EXISTS ix_receipt_posts_client_id ON receipt_posts (client_id, id)')
+
+  // ─── Living board (DISPLAY STATE — outside the ledger) ──────────────────────
+  //
+  // ONE message per client group, holding the whole ledger as an inline-keyboard
+  // grid that every movement re-renders and EDITS in place. editMessageText needs
+  // chat_id + message_id; this table is the only place that pair lives.
+  //
+  // DISPLAY STATE, NOT MONEY. No column here feeds SUM(amount), no route computes
+  // a balance from it, and DROP TABLE client_boards leaves every balance in the
+  // system bit-for-bit identical — the grid is REBUILT from client_ledger on
+  // every update, never accumulated, so the board's JAMI cannot drift from
+  // SUM(amount) even in principle. NOTHING is added to client_ledger: the ledger
+  // stays append-only and knows nothing about the message it is displayed in.
+  //
+  // chat_id is stored, not re-read. POST /api/clients/:id/link unlinks whoever
+  // holds a chat_id and rebinds it, so a client's stored chat_id can become
+  // ANOTHER client's group; a message_id is only meaningful inside the chat it
+  // was issued in, so the edit must use the chat_id the message was posted to.
+  // server/board.js treats a mismatch as "no board here" and posts a fresh one.
+  //
+  // state: 'pending' (the DEFAULT, for a creator that reserves a row before
+  // sending) | 'live' (a message exists and may be edited) | 'gone' (Telegram
+  // has said this message can never be edited again — the next movement posts a
+  // fresh board instead of retrying forever).
+  //
+  // Node-only, with no mirror in database/models.py — the same deliberate
+  // exception to this file's Python-parity contract that receipt_posts is: only
+  // the Node server posts boards, and create_all ignores tables it has no model
+  // for. (handlers/board.py answers the grid's callbacks off clients.telegram_chat_id
+  // and never reads this table, so there is nothing for the Python side to mirror.)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS client_boards (
+      client_id   INTEGER NOT NULL,
+      chat_id     BIGINT  NOT NULL,
+      message_id  BIGINT,
+      state       VARCHAR NOT NULL DEFAULT 'pending',
+      updated_at  DATETIME,
+      PRIMARY KEY (client_id),
+      FOREIGN KEY(client_id) REFERENCES clients (id)
+    )
+  `)
+
+  // client_id is the PRIMARY KEY, so every lookup board.js makes is already
+  // covered. This index serves the INVERSE question — "which client's board
+  // lives in this group?" — which is what a re-link or a leak audit asks, and
+  // the only way to find a board orphaned in a group its client has left.
+  db.exec('CREATE INDEX IF NOT EXISTS ix_client_boards_chat_id ON client_boards (chat_id)')
 }

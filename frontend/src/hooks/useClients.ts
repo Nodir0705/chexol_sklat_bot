@@ -1,13 +1,13 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   fetchClients, fetchClient, createClient, updateClient, deleteClient,
-  fetchLedger, postHandover, postReturn, postPayment, reverseEntry,
+  fetchLedger, postHandover, postReturn, postPayment, reverseEntry, editEntry,
   postHandoverBatch, postReturnBatch,
   fetchClientPrices, setClientPrice, removeClientPrice,
   fetchStatement, sendStatement, linkGroup, unlinkGroup,
 } from '../api/clients'
 import type {
-  BatchItem, BatchResult, Client, ClientPrice, ClientRef,
+  BatchItem, BatchResult, Client, ClientPrice, ClientRef, EditEntryBody,
   LedgerEntry, LedgerResult, LinkResult, Statement,
 } from '../api/clients'
 
@@ -157,6 +157,21 @@ export function useReverseEntry(clientId: number) {
   const invalidate = useLedgerInvalidation(clientId)
   return useMutation<LedgerResult, Error, { entryId: number; note?: string }>({
     mutationFn: ({ entryId, note }) => reverseEntry(entryId, note),
+    onSuccess: invalidate,
+  })
+}
+
+/**
+ * Correct a wrong number on a committed row.
+ *
+ * The write appends TWO rows (a reversal and the corrected re-entry), so it
+ * moves the balance exactly as any other ledger write does — hence the same
+ * invalidation set as useReverseEntry, not a smaller one.
+ */
+export function useEditEntry(clientId: number) {
+  const invalidate = useLedgerInvalidation(clientId)
+  return useMutation<LedgerResult, Error, { entryId: number; body: EditEntryBody }>({
+    mutationFn: ({ entryId, body }) => editEntry(entryId, body),
     onSuccess: invalidate,
   })
 }

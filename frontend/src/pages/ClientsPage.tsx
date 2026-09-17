@@ -113,7 +113,18 @@ export default function ClientsPage() {
   const clients = useClients()
   const [query, setQuery] = useState('')
   const [adding, setAdding] = useState(false)
-  const [selectedId, setSelectedId] = useState<number | null>(null)
+  // The board's DONA/SUMMA buttons deep-link here as ?edit=<clientId>.<entryId>.
+  // Opening on the list and making the operator find the client again would
+  // waste the one thing the deep link buys -- landing on the right row.
+  // ClientDetailPage reads the rest of the parameter itself (readEditParam).
+  const deepLinkClientId = (() => {
+    try {
+      const raw = new URLSearchParams(window.location.search).get('edit')
+      const m = raw ? /^(\d+)\.(\d+)$/.exec(raw) : null
+      return m ? Number(m[1]) : null
+    } catch { return null }
+  })()
+  const [selectedId, setSelectedId] = useState<number | null>(deepLinkClientId)
 
   const closeDetail = useCallback(() => setSelectedId(null), [])
 

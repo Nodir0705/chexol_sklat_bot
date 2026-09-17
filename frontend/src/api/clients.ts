@@ -44,6 +44,8 @@ export interface LedgerEntry {
   performed_by_name: string | null
   /** Set when this row cancels another. */
   reverses_id: number | null
+  /** Set when this row is the corrected re-entry replacing another. */
+  corrects_id: number | null
   /** Set when another row cancels this one. */
   reversed_by: number | null
   created_at: string
@@ -213,6 +215,29 @@ export function postPayment(
 
 export function reverseEntry(entryId: number, note?: string): Promise<LedgerResult> {
   return req<LedgerResult>(`/ledger/${entryId}/reverse`, 'POST', note ? { note } : {})
+}
+
+/**
+ * Correct a WRONG NUMBER on a committed row.
+ *
+ * EXACTLY ONE FIELD, AND NEVER `amount`. The server derives the money, which is
+ * what keeps `qty × unit_price = amount` true by construction — a freely typed
+ * total would make the receipt, the board and the statement print an equation
+ * that does not hold. The union type is what stops a caller sending both.
+ *
+ *   { qty }        the COUNT was wrong; the row's snapshotted unit_price is
+ *                  preserved and the money recomputes from it.
+ *   { unit_price } on a priced row the UNIT PRICE was wrong (the sheet takes a
+ *                  total and back-solves); on a payment it is the MAGNITUDE of
+ *                  the whole row, and the sign is kept from the original.
+ *
+ * Nothing is updated in place: the server appends a reversal plus a corrected
+ * re-entry in one transaction, and `client_prices` is never touched.
+ */
+export type EditEntryBody = { qty: number } | { unit_price: number }
+
+export function editEntry(entryId: number, body: EditEntryBody): Promise<LedgerResult> {
+  return req<LedgerResult>(`/ledger/${entryId}/edit`, 'POST', { ...body })
 }
 
 export interface LinkResult {

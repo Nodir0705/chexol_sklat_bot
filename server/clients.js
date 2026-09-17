@@ -15,6 +15,8 @@
 import { migrate } from './schema.js'
 import { formatReceipt, formatBatchReceipt, productLabel, tashkentStamp, KIND_UI } from './notify.js'
 import { receiptSvg } from './receipt-image.js'
+import { makeBoard } from './board.js'
+import { buildBoard } from './board-grid.js'
 import { makeReceiptLog } from './receipt-log.js'
 
 const MAX_QTY   = 99999          // matches the Mini App's quantity input cap
@@ -40,6 +42,13 @@ const E = {
   isReversal:     "bekor qilish yozuvini bekor qilib bo'lmaydi",
   itemsRequired:  'kamida bitta mahsulot tanlang',
   tooManyItems:   `bir vaqtda ko'pi bilan ${MAX_BATCH} ta mahsulot yuborish mumkin`,
+
+  // ─── Edit (POST /api/ledger/:entryId/edit) ─────────────────────────────────
+  notEditable:    "bu qatorni tuzatib bo'lmaydi",
+  qtyless:        "bu qatorda dona yo'q",
+  qtyZero:        "0 dona — bu yozuvni bekor qiling",
+  editBody:       "faqat dona yoki summadan bittasini yuboring",
+  editNoop:       "hech narsa o'zgarmadi",
 }
 
 // Receipts post as TEXT. The owner tried all three formats in the real groups
@@ -63,6 +72,20 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
   // three column sets — duplicated write cost on every insert, forever.
   migrate(db)
 
+  // `corrects_id` — provenance for POST /api/ledger/:entryId/edit: the re-entry
+  // points at the row it replaces, exactly as `reverses_id` points at the row a
+  // reversal cancels. Written ONCE, at INSERT, on a row that did not exist a
+  // moment earlier. It is NOT money: no route sums it, and dropping the column
+  // leaves every balance bit-for-bit identical.
+  //
+  // server/schema.js owns the canonical DDL; this mirrors it so the route is
+  // runnable against a file that has not been through that migration yet. Both
+  // statements are idempotent — SQLite has no ADD COLUMN IF NOT EXISTS, and the
+  // "duplicate column name" throw IS the success case on an already-migrated
+  // file, which is the idiom schema.js and index.js already use.
+  try { db.exec('ALTER TABLE client_ledger ADD COLUMN corrects_id INTEGER') } catch {}
+  try { db.exec('CREATE INDEX IF NOT EXISTS ix_client_ledger_corrects_id ON client_ledger (corrects_id)') } catch {}
+
   // ─── Prepared statements ────────────────────────────────────────────────────
 
   // One shape for a ledger row, used by the list and by every mutation's echo,
@@ -78,7 +101,7 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
            pc.name AS category_name,
            pp.name AS parent_name,
            l.qty, l.unit_price, l.amount, l.note,
-           l.performed_by, l.performed_by_name, l.reverses_id,
+           l.performed_by, l.performed_by_name, l.reverses_id, l.corrects_id,
            (SELECT r.id FROM client_ledger r WHERE r.reverses_id = l.id) AS reversed_by,
            l.created_at
     FROM client_ledger l
@@ -105,14 +128,23 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
     balance:    db.prepare('SELECT COALESCE(SUM(amount), 0) AS balance FROM client_ledger WHERE client_id = ?'),
 
     ledger:     db.prepare(`${LEDGER_SELECT} WHERE l.client_id = ? ORDER BY l.created_at DESC, l.id DESC LIMIT ?`),
+    // The living board is REBUILT from this on every movement -- never
+    // accumulated -- so its total cannot drift from SUM(amount). It must be the
+    // FULL ledger ascending: q.ledger's DESC LIMIT slice would make the
+    // "+N oldingi" fold row uncomputable.
+    allLedger:  db.prepare(`${LEDGER_SELECT} WHERE l.client_id = ? ORDER BY l.created_at, l.id`),
     entry:      db.prepare(`${LEDGER_SELECT} WHERE l.id = ?`),
     rawEntry:   db.prepare('SELECT * FROM client_ledger WHERE id = ?'),
     reversalOf: db.prepare('SELECT id FROM client_ledger WHERE reverses_id = ? LIMIT 1'),
+    // Which row (if any) already corrects this one. Read for display only --
+    // the edit route's serialiser is reversalOf, because a corrected row is
+    // always a reversed row and the reversal is what the write lock orders.
+    correctionOf: db.prepare('SELECT id FROM client_ledger WHERE corrects_id = ? LIMIT 1'),
     insLedger:  db.prepare(`
       INSERT INTO client_ledger
         (client_id, kind, category_id, qty, unit_price, amount, note,
-         performed_by, performed_by_name, reverses_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         performed_by, performed_by_name, reverses_id, corrects_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `),
     // Net quantity of one product a client currently holds. Reversals flip the
     // sign of amount while keeping kind and qty, so the direction must be read
@@ -159,6 +191,22 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
   // down this closure — receipt-log.js imports NOTHING from here, so the
   // dependency runs one way only.
   const log = makeReceiptLog({ db, notify, build })
+
+  // The living board: ONE message per client group, edited after every movement
+  // rather than re-posted. It is rebuilt from the ledger each time, so it cannot
+  // drift from SUM(amount), and like every other notification concern here it can
+  // never throw into a request or affect a ledger write.
+  const board = makeBoard({ db, notify, buildBoard })
+
+  /** Refresh a client's board. Fire-and-forget, after the rows are committed. */
+  function refreshBoard(client) {
+    if (!client || client.telegram_chat_id == null) return
+    try {
+      Promise.resolve(
+        board.refresh(client, q.allLedger.all(client.id), balanceOf(client.id))
+      ).catch(() => {})
+    } catch {}
+  }
 
   // ─── Validation ─────────────────────────────────────────────────────────────
   //
@@ -268,6 +316,17 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
 
   const somCap = n => String(Math.abs(Math.trunc(n || 0)))
     .replace(/\B(?=(\d{3})+(?!\d))/g, '\u00A0') + '\u00A0so\'m'
+
+  /** Signed magnitude without the unit, for a "before → after" pair. */
+  const numCap = n => (n < 0 ? '\u2212' : '')
+    + String(Math.abs(Math.trunc(n || 0))).replace(/\B(?=(\d{3})+(?!\d))/g, '\u00A0')
+
+  // notify.js escapes everything IT renders, but it keeps `esc` module-private
+  // and the correction line below is built here. Category names and notes are
+  // owner-entered and every message goes out as parse_mode HTML, so the one
+  // line this file interpolates itself has to escape what it interpolates.
+  const escHtml = v => String(v ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
   function compactCaption(d) {
     const ui = KIND_UI[d.kind] ?? KIND_UI.adjustment
@@ -380,6 +439,10 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
                        { postId = null, replyTo = null } = {}) {
     if (typeof notify !== 'function') return Promise.resolve()
     if (!client || client.telegram_chat_id == null) return Promise.resolve()
+    // Every path that posts a receipt also refreshes the board -- movements,
+    // single entries and reversals alike -- so a correction can never leave the
+    // board asserting a total the ledger has moved past.
+    refreshBoard(client)
     // Declared outside the try so the outer catch's postText fallback can still
     // settle from it, but BUILT INSIDE it: a throw out here would land in
     // insertAndReply's catch AFTER COMMIT and answer 500 for a delivery that is
@@ -466,6 +529,29 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
    *  what makes receipt-log.js's fire-and-forget settle() UPDATE safe. If
    *  someone later writes an async handler that opens a transaction, that
    *  UPDATE could join it and vanish on its ROLLBACK. */
+  /**
+   * A refusal raised from INSIDE a transaction.
+   *
+   * tx() rolls back on a THROW and commits on a return, so a guard that can
+   * fire after the first insert must throw or it commits the very row it was
+   * refusing. Every guard in the edit route therefore throws this, and the
+   * route's catch maps it back to the status code and Uzbek message it carries;
+   * anything untagged is still a 500, as it is everywhere else in this file.
+   */
+  class Refusal extends Error {
+    constructor(code, body) {
+      super(body?.error ?? 'refused')
+      this.name = 'Refusal'
+      this.code = code
+      this.body = body
+    }
+  }
+
+  /** @returns {never} */
+  function refuse(code, error, extra = {}) {
+    throw new Refusal(code, { error, ...extra })
+  }
+
   function tx(fn) {
     db.exec('BEGIN')
     try {
@@ -776,7 +862,7 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
       clientId, row.kind, row.category_id ?? null, row.qty ?? null,
       row.unit_price ?? null, row.amount, row.note ?? null,
       user?.id ?? null, user?.first_name ?? user?.username ?? null,
-      row.reverses_id ?? null,
+      row.reverses_id ?? null, row.corrects_id ?? null,
     )
     return q.lastId.get().id
   }
@@ -965,7 +1051,7 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
           orig.client_id, orig.kind, orig.category_id, orig.qty, orig.unit_price,
           -orig.amount, note ?? `Bekor qilindi #${entryId}`,
           user?.id ?? null, user?.first_name ?? user?.username ?? null,
-          entryId,
+          entryId, null,
         )
         // `q.lastId` is SELECT last_insert_rowid(), so it must be read BEFORE
         // log.record runs its own inserts. Reading it after would return a
@@ -989,6 +1075,254 @@ export default async function clientRoutes(app, { db, requireAuth, requireRead, 
       return reply.code(500).send({ error: String(err) })
     }
   })
+
+
+  // ─── Edit (a wrong NUMBER, corrected without touching a committed row) ──────
+  //
+  // THE DIFFERENCE FROM /reverse, STATED ONCE: a reversal says "this did not
+  // happen". An edit says "this happened, with a different number". So an edit
+  // is a reversal AND a re-entry, written in ONE transaction — two appended
+  // rows, never an UPDATE, so balance is still SUM(amount) and the original is
+  // still readable, byte-for-byte, with the operator and stamp that wrote it.
+  //
+  // BODY IS `{ qty }` OR `{ unit_price }` — EXACTLY ONE, AND NEVER `amount`.
+  // The money is DERIVED here, which is what makes `qty × unit_price = amount`
+  // an invariant by construction rather than by validation. Three renderers
+  // (_goods(), formatReceipt, receiptSvg) print that as a literal equation; a
+  // freely-typed total would make all three print a lie.
+  //
+  // WHAT EACH FIELD MEANS, decided:
+  //   qty         — the COUNT was wrong. The row's SNAPSHOTTED unit_price is
+  //                 PRESERVED and the money recomputes from it. Never
+  //                 resolvePrice(): re-resolving would silently re-price a past
+  //                 delivery every time the owner moves the price list.
+  //   unit_price  — on a priced row, the UNIT PRICE was wrong (the sheet takes
+  //                 a total and back-solves); on a qty-less row (a payment) it
+  //                 is the MAGNITUDE of the whole row.
+  //   category_id — IMMUTABLE. Changing the product is a different act: reverse
+  //                 and re-enter.
+  // The SIGN always comes from Math.sign(orig.amount), never from a kind table:
+  // movementRow signs only 'return' and a payment gets its minus in the payment
+  // route, so the original's own sign is the one honest, kind-independent rule.
+  // A row whose edit would flip its sign is not an edit.
+  //
+  // client_prices is NEVER touched. The client's standing price is unchanged
+  // and the next handover uses it; the sheet says so.
+  app.post('/api/ledger/:entryId/edit', (req, reply) => {
+    const user = requireAuth(req, reply)
+    if (!user) return
+    const entryId = idParam(req.params.entryId)
+    if (!entryId) return reply.code(400).send({ error: E.badId })
+
+    // ── Body shape, before the transaction ────────────────────────────────────
+    const body = req.body ?? {}
+    // Refused rather than ignored: an operator who sent `amount` expects it to
+    // take effect, and silently dropping it would write a different number than
+    // the one they were shown.
+    if (body.amount !== undefined) return reply.code(400).send({ error: E.editBody })
+
+    const hasQty   = body.qty !== undefined && body.qty !== null
+    const hasPrice = body.unit_price !== undefined && body.unit_price !== null
+    // Both or neither — there is no edit that means two things at once.
+    if (hasQty === hasPrice) return reply.code(400).send({ error: E.editBody })
+
+    if (hasQty) {
+      // 0 is refused with its own message: "this did not happen" is a plain
+      // reverse, and that route exists. Anything else falls to the range rule,
+      // uncoerced — the string "10" is rejected, as everywhere else here.
+      if (body.qty === 0) return reply.code(400).send({ error: E.qtyZero })
+      if (!isQty(body.qty)) return reply.code(400).send({ error: E.qty })
+    }
+    if (hasPrice && !isMoney(body.unit_price)) {
+      return reply.code(400).send({ error: E.unitPrice })
+    }
+
+    let out
+    try {
+      // ONE synchronous transaction, no await inside it (this file's standing
+      // rule). Every refusal below THROWS rather than returns: the held check
+      // fires after the reversal is already inserted, and only a throw gives it
+      // the ROLLBACK that keeps an orphan reversal off the disk.
+      out = tx(() => {
+        const orig = q.rawEntry.get(entryId)
+        if (!orig) refuse(404, E.entryNotFound)
+        // A cancellation is not a business event with a wrong number in it; it
+        // is the record that one was undone.
+        if (orig.reverses_id != null) refuse(409, E.isReversal)
+        // THE SERIALISER. Inside the transaction, on SQLite's write lock, so
+        // two operators editing the same row at once is real serialisation and
+        // not check-then-act. An already-corrected row is already reversed, so
+        // this one guard covers both.
+        if (q.reversalOf.get(entryId)) refuse(409, E.alreadyRev)
+        // Math.sign(0) is 0, which would write an amount of 0 and call it a
+        // correction. Nothing this server writes has amount 0.
+        if (orig.amount === 0) refuse(409, E.notEditable)
+
+        const priced = orig.qty != null
+        if (hasQty && !priced) refuse(400, E.qtyless)
+
+        const client = q.getClient.get(orig.client_id)
+        if (!client) refuse(409, E.clientNotFound)
+
+        // ── The corrected numbers, DERIVED ───────────────────────────────────
+        const newQty   = priced ? (hasQty ? body.qty : orig.qty) : null
+        const newPrice = priced ? (hasQty ? orig.unit_price : body.unit_price) : null
+        const magnitude = priced ? newQty * newPrice : body.unit_price
+        if (!isMoney(magnitude)) refuse(400, E.amount)
+        const newAmount = Math.sign(orig.amount) * magnitude
+
+        // A zero-delta pair is two rows of noise, one Telegram message and a
+        // board refresh for a number that did not move.
+        if (newQty === orig.qty && newPrice === orig.unit_price && newAmount === orig.amount) {
+          refuse(400, E.editNoop)
+        }
+
+        // ── 1. THE REVERSAL. FIRST, ALWAYS ───────────────────────────────────
+        // kind / category_id / qty / unit_price copied verbatim so the ledger
+        // still reads as a pair; only the amount is opposite.
+        const revId = insertRow(user, orig.client_id, {
+          kind: orig.kind, category_id: orig.category_id,
+          qty: orig.qty, unit_price: orig.unit_price,
+          amount: -orig.amount,
+          note: `Tuzatildi #${entryId}`,
+          reverses_id: entryId,
+        })
+
+        // ── 2. HELD QUANTITY, BOTH DIRECTIONS ────────────────────────────────
+        // Run only NOW: the reversal is already in this transaction, so this
+        // reads the world WITHOUT the original and the delta is the re-entry's
+        // alone. Both directions, not just a return — a handover edited DOWN
+        // underneath an existing return drives held negative just as surely.
+        // The kind filter mirrors q.heldQty's own WHERE clause: a delta counted
+        // under a different predicate than the total is not a comparison.
+        if (newQty !== null && orig.category_id != null
+            && (orig.kind === 'handover' || orig.kind === 'return')) {
+          const { held } = q.heldQty.get(orig.client_id, orig.category_id)
+          const dir = newAmount > 0 ? newQty : -newQty
+          if (held + dir < 0) {
+            // `held` here EXCLUDES the original — its reversal is already in
+            // this transaction — so it is not a figure to show anyone: in the
+            // handover direction it is negative, and "the client has −8 of this"
+            // is not a sentence. What the operator needs is the BOUND on the
+            // new count; `held` in the payload is their REAL current holding,
+            // which is the number every other screen shows them.
+            const current = held + (orig.amount > 0 ? orig.qty : -orig.qty)
+            if (newAmount > 0) {
+              const min = -held
+              refuse(409,
+                `mijoz bu mahsulotdan ${min} dona qaytargan — kamida ${min} dona bo'lishi kerak`,
+                { held: current, min })
+            }
+            // Return direction: `held` is what is left once this return is
+            // taken out, which IS the cap, and the existing message says it.
+            refuse(409, heldError(held).error, { held, max: held })
+          }
+        }
+
+        // ── 3. THE RE-ENTRY ──────────────────────────────────────────────────
+        // corrects_id is the provenance link; the note is the ORIGINAL's, since
+        // what the operator wrote about the delivery is still true.
+        const newId = insertRow(user, orig.client_id, {
+          kind: orig.kind, category_id: orig.category_id,
+          qty: newQty, unit_price: newPrice,
+          amount: newAmount,
+          note: orig.note,
+          corrects_id: entryId,
+        })
+
+        // Both rows under ONE receipt_posts row, mirroring the reverse route,
+        // so a later reversal of the re-entry has something to stamp.
+        // insertRow reads q.lastId itself, immediately, so both ids are already
+        // in hand before log.record runs its own inserts and clobbers it.
+        const postId = log.record(client, 'movement', [revId, newId])
+        return { id: newId, revId, postId, client, orig }
+      })
+    } catch (err) {
+      if (err instanceof Refusal) return reply.code(err.code).send(err.body)
+      return reply.code(500).send({ error: String(err) })
+    }
+
+    try {
+      const entry   = withPath(q.entry.get(out.id))
+      const balance = balanceOf(out.client.id)
+      reply.send({ entry, balance })          // the API answers FIRST, as every route here does
+      void editTail(out, entry, balance)
+      return reply
+    } catch (err) {
+      return reply.code(500).send({ error: String(err) })
+    }
+  })
+
+  /**
+   * Tell the group, stamp the card that now asserts the old number, redraw the
+   * board — a DETACHED async function with a terminal catch, started after
+   * reply.send(), shaped exactly like correctionTail.
+   *
+   * THE ORDERING PRINCIPLE, same as correctionTail's: the correction LINE goes
+   * first and is AWAITED. Editing a message notifies nobody, so this line is
+   * the client's notification AND their searchable record — and a silent change
+   * to a debt is precisely what a client must be told about. If everything
+   * after it fails, the group UNDER-informs (a stale grid beside a correct
+   * line) rather than MISINFORMS.
+   */
+  async function editTail(out, entry, balance) {
+    try {
+      // FIRST, and deliberately not last: refreshBoard never throws (it is
+      // internally try/catch'd) and never awaits, so redrawing here costs the
+      // line below nothing and guarantees the grid matches SUM(amount) even if
+      // the group post fails. postReceipt takes the same position for the same
+      // reason.
+      refreshBoard(out.client)
+
+      const orig = out.orig
+      const label = entry.category_id != null
+        ? productLabel(entry.category_name, entry.parent_name)
+        : (KIND_UI[entry.kind] ?? KIND_UI.adjustment).label
+      const parts = [`✎ <b>Tuzatildi</b>`, escHtml(label)]
+      if (orig.qty != null && entry.qty != null && orig.qty !== entry.qty) {
+        parts.push(`${numCap(orig.qty)} → ${numCap(entry.qty)} dona`)
+      }
+      if (orig.unit_price != null && entry.unit_price != null
+          && orig.unit_price !== entry.unit_price) {
+        parts.push(`${numCap(orig.unit_price)} → ${somCap(entry.unit_price)} / dona`)
+      }
+      // BOTH SIDES SIGNED, or the pair lies. somCap drops the sign, so
+      // "−360 000 → 650 000 so'm" would read as a payment turning into a debt —
+      // and a product label carries no kind word to correct the impression.
+      parts.push(`${numCap(orig.amount)} → ${numCap(entry.amount)}\u00A0so'm`)
+      parts.push(balance < 0
+        ? `Oldindan to'lov: <b>${somCap(balance)}</b>`
+        : `Jami qarz: <b>${somCap(balance)}</b>`)
+      const line = parts.join(' · ')
+
+      // Posted through postText with the reserved postId so the row SETTLES.
+      // A receipt_posts row left 'pending' is permanently unstampable, which
+      // would make the re-entry the one row whose own later correction could
+      // never strike the message that carries it.
+      let post = log.forEntry(orig.id)
+      if (post && post.state === 'pending') {
+        await log.settled(post.id)      // close the in-flight window
+        post = log.get(post.id)
+      }
+      const live = out.client.telegram_chat_id
+      const replyTo = log.stampable(post) && String(post.chat_id) === String(live)
+        ? post.message_id
+        : null
+
+      // The snapshot is what makes the claim "a later reversal of the re-entry
+      // has something to stamp" TRUE: stampable() requires snapshot != null, so
+      // without one this card would be permanently un-inkable. It freezes the
+      // RE-ENTRY's render inputs, which is the row a later reversal cancels.
+      const snapshot = snapshotOf(out.client, [entry], balance, null, null)
+      await postText(out.client, () => line, { postId: out.postId, replyTo, snapshot })
+
+      // STAMP THE ORIGINAL'S CARD. Without this a receipt still sitting in the
+      // group asserts "5 dona" while the board and the balance say 6.
+      if (log.stampable(post)) await log.stamp(post.id)
+    } catch (err) {
+      console.warn('[receipt] edit:', err?.message ?? err)
+    }
+  }
 
   /**
    * Post the correction and stamp the card it corrects — a DETACHED async

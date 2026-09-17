@@ -40,9 +40,10 @@ export const KIND_UI = {
 }
 
 const NOTE_MAX = 120
-// The reverse route writes this when the owner gives no reason; it is bookkeeping
-// noise, not a message to the client.
-const AUTO_NOTE = /^Bekor qilindi #\d+$/
+// What the reverse and edit routes write when the owner gives no reason. It is
+// bookkeeping noise pointing at a row id, not a message to a client -- and the
+// client cannot resolve the id anyway.
+const AUTO_NOTE = /^(Bekor qilindi|Tuzatildi) #\d+$/
 
 // The batch list's rule, U+2500 × 10. Ten columns is wide enough to read as a
 // rule and short enough that it can never be the line that wraps.
@@ -493,7 +494,7 @@ export function makeNotifier(botToken) {
   const token = typeof botToken === 'string' ? botToken.trim() : ''
   if (!token) console.warn('[notify] BOT_TOKEN missing — receipts will not be posted')
 
-  async function notify(chatId, text, { replyTo = null } = {}) {
+  async function notify(chatId, text, { replyTo = null, reply_markup = null } = {}) {
     if (chatId === null || chatId === undefined || chatId === '') {
       return { ok: false, skipped: true }
     }
@@ -512,6 +513,8 @@ export function makeNotifier(botToken) {
           // Omitted entirely when there is no parent, so every existing
           // two-argument caller sends exactly the body it sends today.
           ...(reply ? { reply_parameters: reply } : {}),
+          // The living board posts its grid with the message that carries it.
+          ...(reply_markup ? { reply_markup } : {}),
         }),
         signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
       })
@@ -618,7 +621,7 @@ export function makeNotifier(botToken) {
    *  and a renderer fault must never mark a live card 'gone'.
    */
 
-  notify.edit = async function editReceipt(chatId, messageId, { isPhoto, svg, caption, text }) {
+  notify.edit = async function editReceipt(chatId, messageId, { isPhoto, svg, caption, text, reply_markup = null }) {
     if (chatId === null || chatId === undefined || chatId === '') {
       return { ok: false, skipped: true }
     }
@@ -661,6 +664,10 @@ export function makeNotifier(botToken) {
             text: String(text ?? ''),
             parse_mode: 'HTML',
             disable_web_page_preview: true,
+            // MUST be sent on every edit. editMessageText WITHOUT reply_markup
+            // REMOVES the inline keyboard, so omitting it would wipe the living
+            // board's grid on the first edit after it was posted.
+            ...(reply_markup ? { reply_markup } : {}),
           }),
           signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
         }

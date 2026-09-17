@@ -1,9 +1,9 @@
-import { useState, useMemo, useCallback } from 'react'
+import { useState, useMemo, useCallback, useEffect, useRef } from 'react'
 import { useTree } from '../hooks/useWarehouse'
 import { haptic, useBackButton } from '../hooks/useTelegram'
 import {
   useClient, useLedger, useClientPrices, useStatement,
-  useHandoverBatch, useReturnBatch, usePayment, useReverseEntry,
+  useHandoverBatch, useReturnBatch, usePayment, useReverseEntry, useEditEntry,
   useSetClientPrice, useRemoveClientPrice, useSendStatement,
   useLinkGroup,
   useUnlinkGroup,
@@ -121,16 +121,20 @@ const KIND_META: Record<LedgerKind, { label: string; icon: string }> = {
   adjustment: { label: 'Tuzatish',   icon: '✏️' },
 }
 
-function LedgerRow({ entry, onReverse }: {
+function LedgerRow({ entry, onReverse, onEdit }: {
   entry: LedgerEntry
   onReverse: (entry: LedgerEntry) => void
+  onEdit: (entry: LedgerEntry, field: EditField) => void
 }) {
   const { dateLabel, time } = formatTashkent(entry.created_at)
   const isReversed = entry.reversed_by !== null
   const isReversal = entry.reverses_id !== null
+  const isCorrection = entry.corrects_id !== null
   const meta = KIND_META[entry.kind]
   // A reversal can never itself be reversed, and a cancelled row cannot be
-  // cancelled twice — the server refuses both.
+  // cancelled twice — the server refuses both. An EDIT is a reversal plus a
+  // re-entry, so it is offered under exactly the same condition: the two
+  // controls can never disagree about which rows are still live.
   const canReverse = !isReversed && !isReversal
 
   const amountColor = isReversed
@@ -163,6 +167,15 @@ function LedgerRow({ entry, onReverse }: {
               ↩ Bekor qilish
             </span>
           )}
+          {/* ✎ marks a row that REPLACES an earlier one. Only the name, never
+              the figures: these figures are the live ones and do belong in the
+              total — marking them would read as "these numbers are suspect". */}
+          {isCorrection && !isReversed && (
+            <span className="text-xs px-1.5 py-0.5 rounded shrink-0"
+                  style={{ background: 'rgba(128,128,128,.15)', color: 'var(--tg-theme-hint-color)' }}>
+              ✎ Tuzatilgan
+            </span>
+          )}
         </div>
 
         {entry.qty !== null && entry.unit_price !== null && (
@@ -187,11 +200,20 @@ function LedgerRow({ entry, onReverse }: {
           {formatSignedMoney(entry.amount)}
         </span>
         {canReverse && (
-          <button onClick={() => { haptic('light'); onReverse(entry) }}
-                  className="text-xs px-2 py-1 rounded-lg active:scale-90 transition-transform no-underline"
-                  style={{ background: 'rgba(239,68,68,.1)', color: RED }}>
-            ↩ Bekor
-          </button>
+          <div className="flex gap-1.5">
+            {/* Tapping the money opens SUMMA, tapping the count opens DONA —
+                the sheet still shows both, so a mis-tap costs one tap. */}
+            <button onClick={() => { haptic('light'); onEdit(entry, entry.qty !== null ? 'qty' : 'sum') }}
+                    className="text-xs px-2 py-1 rounded-lg active:scale-90 transition-transform no-underline"
+                    style={{ background: 'rgba(128,128,128,.15)', color: 'var(--tg-theme-text-color)' }}>
+              ✏️ Tuzatish
+            </button>
+            <button onClick={() => { haptic('light'); onReverse(entry) }}
+                    className="text-xs px-2 py-1 rounded-lg active:scale-90 transition-transform no-underline"
+                    style={{ background: 'rgba(239,68,68,.1)', color: RED }}>
+              ↩ Bekor
+            </button>
+          </div>
         )}
       </div>
     </div>
@@ -300,13 +322,306 @@ function ReverseConfirm({ clientId, entry, onClose }: {
   )
 }
 
+// ─── Tuzatish (edit) sheet ────────────────────────────────────────────────────
+//
+// A committed row with a WRONG NUMBER in it. Not a reversal — a reversal says
+// "this did not happen"; this says "this happened, with a different number".
+//
+// The server appends a reversal plus a corrected re-entry in one transaction,
+// so nothing is updated in place and the balance is still SUM(amount). The body
+// carries EXACTLY ONE field and never `amount`: the money is derived on the
+// server, which is what keeps `qty × unit_price = amount` true by construction.
+//
+// WHAT EACH FIELD MEANS — the same two readings the route implements:
+//   DONA  the COUNT was wrong. The row's snapshotted unit price is PRESERVED
+//         and the money recomputes from it, so a past delivery is never
+//         re-priced because the owner has since moved the price list.
+//   SUMMA on a priced row the UNIT PRICE was wrong: this field takes a TOTAL
+//         (what the owner means by "Summa") and back-solves the unit price. On
+//         a payment there is no count, so SUMMA is the whole row and only its
+//         magnitude moves — the sign stays the original's.
+
+export type EditField = 'qty' | 'sum'
+
+function EditSheet({ clientId, entry, balance, field, onClose }: {
+  clientId: number
+  entry: LedgerEntry
+  balance: number
+  field: EditField
+  onClose: () => void
+}) {
+  const edit = useEditEntry(clientId)
+  const meta = KIND_META[entry.kind]
+  const { dateLabel, time } = formatTashkent(entry.created_at)
+
+  // A row with no count (a payment) has only one editable number, so the DONA
+  // half of this sheet does not exist for it.
+  const priced = entry.qty !== null && entry.unit_price !== null
+  const origQty  = entry.qty ?? 0
+  const origUnit = entry.unit_price ?? 0
+  const origTotal = Math.abs(entry.amount)
+
+  const [mode, setMode] = useState<EditField>(priced ? field : 'sum')
+  const [qty, setQty] = useState(origQty || 1)
+  const [total, setTotal] = useState(origTotal)
+  const [err, setErr] = useState<string | null>(null)
+
+  // THE SIGN COMES FROM THE ORIGINAL, never from the kind — exactly as the
+  // server does it. A payment that changes sign is not an edit.
+  const sign = entry.amount < 0 ? -1 : 1
+
+  // ── What will actually be written ──────────────────────────────────────────
+  // SUMMA never touches the count and DONA never touches the price: the two
+  // modes are the two readings, and each moves exactly one number.
+  const solvedUnit   = priced && origQty > 0 ? Math.round(total / origQty) : 0
+  const newQty       = mode === 'qty' ? qty : (priced ? origQty : null)
+  const newUnitPrice = mode === 'qty' ? (priced ? origUnit : null) : (priced ? solvedUnit : null)
+  const magnitude    = priced
+    ? (mode === 'qty' ? qty * origUnit : solvedUnit * origQty)
+    : total
+  const newAmount    = sign * magnitude
+  const newBalance   = balance - entry.amount + newAmount
+
+  // The snap, shown BEFORE saving and never refused: an indivisible total is
+  // the commonest real SUMMA edit (a round discount), so the operator is shown
+  // the figure they will actually get and confirms it.
+  const snapped = mode === 'sum' && priced && total > 0 && solvedUnit > 0 && magnitude !== total
+
+  const tooSmall = mode === 'sum' && priced && total > 0 && solvedUnit < 1
+  const noop =
+    mode === 'qty' ? qty === origQty
+    : priced       ? solvedUnit === origUnit
+    :                total === origTotal
+  const inRange =
+    mode === 'qty' ? qty >= 1 && qty <= MAX_QTY && magnitude >= 1 && magnitude <= MAX_MONEY
+    :                total >= 1 && magnitude >= 1 && magnitude <= MAX_MONEY
+
+  const canSave = inRange && !tooSmall && !noop && !edit.isPending
+
+  const submit = () => {
+    if (!canSave) return
+    haptic('medium')
+    setErr(null)
+    // EXACTLY ONE FIELD. `amount` is never sent — the server derives it.
+    const body = mode === 'qty'
+      ? { qty }
+      : { unit_price: priced ? solvedUnit : total }
+    edit.mutate({ entryId: entry.id, body }, {
+      onSuccess: () => { haptic('success'); onClose() },
+      onError: (e) => { haptic('error'); setErr(errText(e)) },
+    })
+  }
+
+  const Figure = ({ label, value, tone }: { label: string; value: string; tone?: string }) => (
+    <div className="flex items-baseline justify-between gap-3">
+      <span className="text-xs shrink-0" style={{ color: 'var(--tg-theme-hint-color)' }}>{label}</span>
+      <span className="text-sm font-semibold whitespace-nowrap"
+            style={{ color: tone ?? 'var(--tg-theme-text-color)' }}>{value}</span>
+    </div>
+  )
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center px-5 py-6 overflow-y-auto"
+         style={{ background: 'rgba(0,0,0,.5)' }} onClick={onClose}>
+      <div className="w-full max-w-sm rounded-3xl p-5 shadow-2xl my-auto"
+           style={{ background: 'var(--tg-theme-bg-color)' }}
+           onClick={e => e.stopPropagation()}>
+
+        <p className="font-bold text-base mb-0.5">✏️ Tuzatish</p>
+        {/* The FULL product name, untruncated — the board clips it, this must not. */}
+        <p className="font-semibold text-sm break-words">
+          {meta.icon} {entry.category_name ?? meta.label}
+        </p>
+        {entry.category_path && (
+          <p className="text-xs break-words" style={{ color: 'var(--tg-theme-hint-color)' }}>
+            📍 {entry.category_path}
+          </p>
+        )}
+        <p className="text-xs mt-0.5 mb-3" style={{ color: 'var(--tg-theme-hint-color)' }}>
+          {dateLabel}, {time}
+        </p>
+
+        {/* Hozir — what the row says today */}
+        <div className="rounded-2xl p-3.5 mb-3 space-y-1"
+             style={{ background: 'var(--tg-theme-secondary-bg-color)' }}>
+          <p className="text-xs font-semibold" style={{ color: 'var(--tg-theme-hint-color)' }}>
+            Hozir
+          </p>
+          {priced
+            ? <Figure label="Dona × narx" value={`${origQty} × ${formatMoney(origUnit)}`} />
+            : <Figure label="Summa" value={formatMoney(origTotal)} />}
+          <Figure label="Yozuv" value={formatSignedMoney(entry.amount)}
+                  tone={entry.amount > 0 ? RED : GREEN} />
+        </div>
+
+        {/* Which number was wrong. Only a priced row has two answers. */}
+        {priced && (
+          <div className="flex gap-1.5 p-1 rounded-2xl mb-3"
+               style={{ background: 'var(--tg-theme-secondary-bg-color)' }}>
+            {([['qty', 'DONA'], ['sum', 'SUMMA']] as const).map(([id, label]) => (
+              <button key={id} onClick={() => { haptic('light'); setErr(null); setMode(id) }}
+                      className="flex-1 py-2 rounded-xl text-xs font-semibold transition-all active:scale-95"
+                      style={mode === id
+                        ? { background: ACCENT, color: 'var(--tg-theme-button-text-color)' }
+                        : { color: 'var(--tg-theme-hint-color)' }}>
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* ── DONA: the count was wrong; the price is kept ── */}
+        {mode === 'qty' && priced && (
+          <>
+            <QtyStepper qty={qty} tone={ACCENT} large
+                        onChange={(next) => { setErr(null); setQty(next) }} />
+            <div className="flex flex-wrap gap-2 justify-center mt-3">
+              {[1, 2, 5, 10, 20, 50].map(n => (
+                <button key={n} onClick={() => { haptic('light'); setErr(null); setQty(n) }}
+                        className="px-4 py-2 rounded-full text-sm font-semibold transition-all active:scale-95"
+                        style={qty === n
+                          ? { background: ACCENT, color: 'var(--tg-theme-button-text-color)' }
+                          : { background: 'var(--tg-theme-secondary-bg-color)' }}>
+                  {n}
+                </button>
+              ))}
+            </div>
+            <p className="text-xs text-center mt-3" style={{ color: 'var(--tg-theme-hint-color)' }}>
+              Narx o'zgarmaydi: {formatMoney(origUnit)} / dona
+            </p>
+            {qty < 1 && (
+              <p className="text-xs text-center mt-1" style={{ color: RED }}>
+                0 dona — bu yozuvni "↩ Bekor" bilan bekor qiling
+              </p>
+            )}
+          </>
+        )}
+
+        {/* ── SUMMA: a total, back-solved into a unit price (or, on a payment,
+              the whole row's magnitude) ── */}
+        {mode === 'sum' && (
+          <>
+            <input type="text" inputMode="numeric" autoFocus
+                   value={total === 0 ? '' : groupDigits(total)}
+                   onChange={e => {
+                     const digits = e.target.value.replace(/[^0-9]/g, '')
+                     setErr(null)
+                     setTotal(digits === '' ? 0 : Math.min(MAX_MONEY, Number(digits)))
+                   }}
+                   placeholder="0"
+                   className="w-full text-center text-3xl font-bold outline-none border-b-2 py-2 bg-transparent"
+                   style={{ borderColor: ACCENT, color: 'var(--tg-theme-text-color)' }} />
+            <p className="text-center text-sm mt-2" style={{ color: 'var(--tg-theme-hint-color)' }}>
+              {priced ? `${origQty} dona uchun jami` : 'Yozuv summasi'}
+            </p>
+
+            {tooSmall && (
+              <p className="text-xs text-center mt-2" style={{ color: RED }}>
+                Juda kichik — {origQty} dona uchun kamida {formatMoney(origQty)} bo'lishi kerak
+              </p>
+            )}
+
+            {/* SNAP, SHOW, CONFIRM — never refuse an indivisible total, and
+                never print a number the ledger will not hold. */}
+            {snapped && (
+              <div className="rounded-2xl px-3 py-2.5 mt-3 text-center"
+                   style={{ background: 'rgba(245,158,11,.12)' }}>
+                <p className="text-sm font-semibold whitespace-nowrap">
+                  {groupDigits(total)} → {groupDigits(magnitude)}
+                </p>
+                <p className="text-xs mt-0.5" style={{ color: 'var(--tg-theme-hint-color)' }}>
+                  ({groupDigits(solvedUnit)} × {origQty} dona)
+                </p>
+                <p className="text-xs mt-1" style={{ color: 'var(--tg-theme-hint-color)' }}>
+                  Yaxlitlandi — saqlansa shu summa yoziladi.
+                </p>
+              </div>
+            )}
+          </>
+        )}
+
+        {/* Endi — what will be written, live */}
+        <div className="rounded-2xl p-3.5 mt-3 space-y-1"
+             style={{ background: 'var(--tg-theme-secondary-bg-color)' }}>
+          <p className="text-xs font-semibold" style={{ color: 'var(--tg-theme-hint-color)' }}>
+            Endi
+          </p>
+          {priced && newQty !== null && newUnitPrice !== null
+            ? <Figure label="Dona × narx" value={`${newQty} × ${formatMoney(newUnitPrice)}`} />
+            : <Figure label="Summa" value={formatMoney(magnitude)} />}
+          <Figure label="Yozuv" value={formatSignedMoney(newAmount)}
+                  tone={newAmount > 0 ? RED : GREEN} />
+          <Figure label="Yangi qarz" value={formatMoney(newBalance)}
+                  tone={newBalance > 0 ? RED : GREEN} />
+        </div>
+
+        <p className="text-xs mt-3" style={{ color: 'var(--tg-theme-hint-color)' }}>
+          Yozuv o'chmaydi — teskari yozuv va tuzatilgan yozuv qo'shiladi.
+          {mode === 'sum' && priced && ' Narx faqat shu qatorda o\'zgardi.'}
+        </p>
+
+        {noop && inRange && !tooSmall && (
+          <p className="text-xs mt-2" style={{ color: 'var(--tg-theme-hint-color)' }}>
+            Hech narsa o'zgarmadi.
+          </p>
+        )}
+
+        {err && <div className="mt-3"><ErrorNote message={err} /></div>}
+
+        <div className="flex gap-3 mt-4">
+          <button onClick={onClose} disabled={edit.isPending}
+                  className="flex-1 py-3 rounded-2xl font-semibold text-sm disabled:opacity-50"
+                  style={{ background: 'var(--tg-theme-secondary-bg-color)', color: 'var(--tg-theme-hint-color)' }}>
+            Bekor
+          </button>
+          <button onClick={submit} disabled={!canSave}
+                  className="flex-[2] py-3 rounded-2xl font-bold text-sm disabled:opacity-40 active:scale-95 transition-all"
+                  style={{ background: ACCENT, color: 'var(--tg-theme-button-text-color)' }}>
+            {edit.isPending ? 'Saqlanmoqda...' : 'Saqlash'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ─── Ledger tab ───────────────────────────────────────────────────────────────
 
-function LedgerTab({ clientId }: { clientId: number }) {
+function LedgerTab({ clientId, balance, openEdit, onEditConsumed }: {
+  clientId: number
+  balance: number
+  /** A deep link asking for one row's edit sheet. One-shot. */
+  openEdit: OpenEdit | null
+  onEditConsumed: () => void
+}) {
   const ledger = useLedger(clientId, 200)
   const [reversing, setReversing] = useState<LedgerEntry | null>(null)
+  const [editing, setEditing] = useState<{ entry: LedgerEntry; field: EditField } | null>(null)
+  const [linkMiss, setLinkMiss] = useState<string | null>(null)
 
   const groups = useMemo(() => groupByDay(ledger.data ?? []), [ledger.data])
+
+  const startEdit = useCallback((entry: LedgerEntry, field: EditField) => {
+    setLinkMiss(null)
+    setEditing({ entry, field })
+  }, [])
+
+  // ── The deep link ─────────────────────────────────────────────────────────
+  // Resolved against the ledger page already loaded — NOT through a new
+  // GET /api/ledger/:id. An entry route unscoped by client would become a
+  // whole-business dump by sequential rowid the moment DEV_OPEN_ACCESS=1, so
+  // the concern is removed rather than documented. If the row is off the end of
+  // the page, the page says so instead of opening a sheet on nothing.
+  useEffect(() => {
+    if (!openEdit) return
+    if (ledger.isLoading || ledger.isError) return   // decide only on real data
+    const row = (ledger.data ?? []).find(e => e.id === openEdit.entryId)
+    if (!row) setLinkMiss("Qator ro'yxatda topilmadi")
+    else if (row.reversed_by !== null || row.reverses_id !== null)
+      setLinkMiss("Bu qatorni tuzatib bo'lmaydi")
+    else startEdit(row, openEdit.field)
+    onEditConsumed()
+  }, [openEdit, ledger.isLoading, ledger.isError, ledger.data, startEdit, onEditConsumed])
 
   if (ledger.isLoading) return <CardSkeleton rows={4} />
   if (ledger.isError) {
@@ -320,6 +635,12 @@ function LedgerTab({ clientId }: { clientId: number }) {
 
   return (
     <>
+      {linkMiss && (
+        <div className="mx-3 mb-3">
+          <ErrorNote message={linkMiss} />
+        </div>
+      )}
+
       <div className="mx-3 space-y-3">
         {groups.map(group => (
           <div key={group.label} className="rounded-2xl overflow-hidden"
@@ -341,7 +662,7 @@ function LedgerTab({ clientId }: { clientId: number }) {
             </div>
             {group.items.map((entry, i) => (
               <div key={entry.id}>
-                <LedgerRow entry={entry} onReverse={setReversing} />
+                <LedgerRow entry={entry} onReverse={setReversing} onEdit={startEdit} />
                 {i < group.items.length - 1 && (
                   <div className="mx-4 h-px" style={{ background: 'rgba(128,128,128,.08)' }} />
                 )}
@@ -353,6 +674,11 @@ function LedgerTab({ clientId }: { clientId: number }) {
 
       {reversing && (
         <ReverseConfirm clientId={clientId} entry={reversing} onClose={() => setReversing(null)} />
+      )}
+
+      {editing && (
+        <EditSheet clientId={clientId} entry={editing.entry} balance={balance}
+                   field={editing.field} onClose={() => setEditing(null)} />
       )}
     </>
   )
@@ -1295,6 +1621,43 @@ type Sheet = null | 'handover' | 'return' | 'payment'
 export interface ClientDetailPageProps {
   clientId: number
   onBack: () => void
+  /**
+   * A row to open the edit sheet on, when the caller already knows one.
+   * OPTIONAL: today the deep link is read from the query string by this page
+   * itself (see readEditParam), so ClientsPage needs no change; the prop is the
+   * seam for App.tsx to thread the parameter down once it routes on it.
+   */
+  openEdit?: OpenEdit | null
+}
+
+/**
+ * The Mini App's deep-link payload: `?edit=<clientId>.<entryId>&f=q|s`.
+ *
+ * THE QUERY STRING, NOT THE HASH. Telegram owns the hash and appends
+ * `#tgWebAppData=…` to it; a payload parked there would be fighting the client
+ * for the same space.
+ */
+export interface OpenEdit {
+  entryId: number
+  field: EditField
+}
+
+function readEditParam(clientId: number): OpenEdit | null {
+  try {
+    const params = new URLSearchParams(window.location.search)
+    const raw = params.get('edit')
+    if (!raw) return null
+    const m = /^(\d+)\.(\d+)$/.exec(raw)
+    if (!m) return null
+    // The link names a client. Opening it on a DIFFERENT client's page would
+    // point the sheet at a row this page never loaded.
+    if (Number(m[1]) !== clientId) return null
+    const entryId = Number(m[2])
+    if (!Number.isInteger(entryId) || entryId < 1) return null
+    return { entryId, field: params.get('f') === 'q' ? 'qty' : 'sum' }
+  } catch {
+    return null
+  }
 }
 
 
@@ -1377,10 +1740,27 @@ function GroupLinkCard({ clientId, chatId }: { clientId: number; chatId: number 
   )
 }
 
-export default function ClientDetailPage({ clientId, onBack }: ClientDetailPageProps) {
+export default function ClientDetailPage({ clientId, onBack, openEdit: openEditProp = null }: ClientDetailPageProps) {
   const client = useClient(clientId)
   const [tab, setTab] = useState<Tab>('ledger')
   const [sheet, setSheet] = useState<Sheet>(null)
+  const [openEdit, setOpenEdit] = useState<OpenEdit | null>(openEditProp)
+
+  // ONE SHOT. The query string outlives every render, so without this ref a
+  // re-render would reopen a sheet the operator has just closed.
+  const linkUsed = useRef(false)
+  useEffect(() => {
+    if (linkUsed.current) return
+    const parsed = readEditParam(clientId)
+    if (!parsed) return
+    linkUsed.current = true
+    setOpenEdit(parsed)
+    setTab('ledger')
+  }, [clientId])
+
+  useEffect(() => { if (openEditProp) setOpenEdit(openEditProp) }, [openEditProp])
+
+  const consumeEdit = useCallback(() => { setOpenEdit(null) }, [])
 
   const back = useCallback(() => { haptic('light'); onBack() }, [onBack])
   useBackButton(back)
@@ -1478,7 +1858,10 @@ export default function ClientDetailPage({ clientId, onBack }: ClientDetailPageP
             </div>
           </div>
 
-          {tab === 'ledger'    && <LedgerTab clientId={clientId} />}
+          {tab === 'ledger'    && (
+            <LedgerTab clientId={clientId} balance={balance}
+                       openEdit={openEdit} onEditConsumed={consumeEdit} />
+          )}
           {tab === 'prices'    && <PricesTab clientId={clientId} />}
           {tab === 'statement' && (
             <StatementTab clientId={clientId} hasGroup={client.data.telegram_chat_id !== null} />

@@ -121,6 +121,7 @@ class ClientLedger(Base):
     __table_args__ = (
         Index('ix_client_ledger_client_id_created_at', 'client_id', 'created_at'),
         Index('ix_client_ledger_reverses_id', 'reverses_id'),
+        Index('ix_client_ledger_corrects_id', 'corrects_id'),
     )
 
     id = Column(Integer, primary_key=True)
@@ -135,6 +136,8 @@ class ClientLedger(Base):
     performed_by = Column(BigInteger, nullable=True)      # Telegram id
     performed_by_name = Column(String, nullable=True)
     reverses_id = Column(Integer, ForeignKey('client_ledger.id'), nullable=True)
+    # Set on the re-entry written by an edit, pointing at the row it replaced.
+    corrects_id = Column(Integer, ForeignKey('client_ledger.id'), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     client = relationship("Client", back_populates="ledger")
