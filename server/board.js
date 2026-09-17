@@ -388,6 +388,15 @@ export function makeBoard({ db, notify, buildBoard, boardImage } = {}) {
         // attempted.
         write(s.upsertLive, 'upsertLive',
           client.id, client.telegram_chat_id, sent.messageId, posted)
+        // PIN it. A living board is EDITED in place, so after the first few
+        // movements it sits far up the chat and nothing new arrives to announce
+        // it -- the owner reasonably read that as "it stopped sending the
+        // image". Pinned, it is one tap away at the top of the group and always
+        // current. Silent (no notification) and best-effort: the bot may not be
+        // an admin, and a board nobody pinned still beats no board.
+        if (typeof notify.pin === 'function') {
+          Promise.resolve(notify.pin(client.telegram_chat_id, sent.messageId)).catch(() => {})
+        }
         return
       }
 

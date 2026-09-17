@@ -799,5 +799,29 @@ export function makeNotifier(botToken) {
     }
   }
 
+  /** Pin a message, silently. Best-effort: pinning needs admin rights in a
+   *  supergroup, and a board that could not be pinned is still a board. */
+  notify.pin = async function pinMessage(chatId, messageId) {
+    if (chatId == null || chatId === '' || messageId == null) return { ok: false, skipped: true }
+    if (!token) return { ok: false, error: 'no_token' }
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${token}/pinChatMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, message_id: messageId, disable_notification: true }),
+        signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
+      })
+      const json = await res.json()
+      if (!json || json.ok !== true) {
+        console.warn(`[notify] pin ${chatId}/${messageId}: ${json?.description ?? res.status}`)
+        return { ok: false, error: json?.description }
+      }
+      return { ok: true }
+    } catch (err) {
+      console.warn(`[notify] pin ${chatId}/${messageId}: ${err?.message ?? err}`)
+      return { ok: false, error: String(err?.message ?? err) }
+    }
+  }
+
   return notify
 }
