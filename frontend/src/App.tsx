@@ -37,7 +37,17 @@ function AccessScreen({ reason }: { reason: string }) {
 }
 
 export default function App() {
-  const [page, setPage] = useState<Page>('action')
+  // The board's ✏️ Tahrirlash button deep-links here as ?edit=<clientId>.<entryId>.
+  // Without this the app opened on its default tab, Mijozlar never mounted, and
+  // the parameter it reads was never seen -- so the link landed the operator on
+  // the wrong screen and they had to find the client by hand, losing the one
+  // thing the deep link exists to buy.
+  const deepLinkPage: Page | null = (() => {
+    try {
+      return new URLSearchParams(window.location.search).get('edit') ? 'clients' : null
+    } catch { return null }
+  })()
+  const [page, setPage] = useState<Page>(deepLinkPage ?? 'action')
   const [access, setAccess] = useState<{ allowed: boolean; reason?: string } | null>(null)
 
   useEffect(() => {
